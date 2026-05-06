@@ -1,0 +1,21 @@
+node_modules
+dist
+dist-ssr
+.DS_Store
+.env
+.env.*
+!.env.example
+*.local
+*.log
+.vite
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+Thumbs.db
