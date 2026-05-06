@@ -61,12 +61,13 @@ export const useMetaStore = create<MetaState>()(
         const cur = get();
         const totalRuns = cur.totalRuns + 1;
         const totalWins = cur.totalWins + (outcome === 'won' ? 1 : 0);
+        // Best = longest survival, regardless of win/lose. For a survivors-like,
+        // "how far did you get" is the headline metric — fastest-boss-kill is
+        // less interesting because the boss spawns at a fixed 10:00.
         const bestRunTimeMs =
-          outcome === 'won'
-            ? cur.bestRunTimeMs === null
-              ? timeMs
-              : Math.min(cur.bestRunTimeMs, timeMs)
-            : cur.bestRunTimeMs;
+          cur.bestRunTimeMs === null
+            ? timeMs
+            : Math.max(cur.bestRunTimeMs, timeMs);
         set({ totalRuns, totalWins, bestRunTimeMs });
       },
 

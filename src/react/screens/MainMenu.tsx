@@ -67,7 +67,7 @@ export function MainMenu(): ReactElement {
       >
         <span>Runs: {totalRuns}</span>
         <span>Wins: {totalWins}</span>
-        <span>Best: {formatBestTime(bestRunTimeMs)}</span>
+        <span>Longest: {formatBestTime(bestRunTimeMs)}</span>
       </div>
     </div>
   );
