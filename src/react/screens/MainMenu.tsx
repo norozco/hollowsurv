@@ -1,8 +1,14 @@
-// Main menu screen — entry point before a run.
+// Main menu — title screen first, then character selection.
 // Owner: Agent C5.
 //
-// Shows title + character grid + persistent stats. Picking a character starts
-// the run with that character's loadout (handled by runStore.startRun).
+// Flow:
+//   1. 'title' view — HOLLOWSURV + Start Run + lifetime stats
+//   2. Click Start Run → 'characters' view — pick a character
+//   3. Click character → runStore.startRun(id) → arena
+//
+// View state is local to this component (resets if MainMenu unmounts/remounts).
+// We don't add a new RunPhase because both views are still phase='menu'.
+import { useState } from 'react';
 import type { CSSProperties, ReactElement } from 'react';
 import { useMetaStore } from '../../stores/metaStore';
 import { useRunStore } from '../../stores/runStore';
@@ -35,6 +41,29 @@ const ROOT_STYLE: CSSProperties = {
   gap: 24,
   fontFamily: 'system-ui, sans-serif',
   padding: 24,
+};
+
+const PRIMARY_BUTTON: CSSProperties = {
+  padding: '14px 40px',
+  fontSize: 20,
+  background: '#2a2a3a',
+  color: '#eee',
+  border: '1px solid #555',
+  borderRadius: 4,
+  cursor: 'pointer',
+  letterSpacing: 1,
+  fontFamily: 'inherit',
+};
+
+const SECONDARY_BUTTON: CSSProperties = {
+  padding: '8px 20px',
+  fontSize: 13,
+  background: 'transparent',
+  color: '#bbb',
+  border: '1px solid #555',
+  borderRadius: 4,
+  cursor: 'pointer',
+  fontFamily: 'inherit',
 };
 
 const GRID_STYLE: CSSProperties = {
@@ -83,25 +112,40 @@ function CharacterCard({ char, onPick }: { char: CharacterDefinition; onPick: ()
   );
 }
 
+type View = 'title' | 'characters';
+
 export function MainMenu(): ReactElement {
   const startRun = useRunStore((s) => s.startRun);
   const totalRuns = useMetaStore((s) => s.totalRuns);
   const totalWins = useMetaStore((s) => s.totalWins);
   const bestRunTimeMs = useMetaStore((s) => s.bestRunTimeMs);
 
-  const characters = Object.values(CHARACTERS);
+  const [view, setView] = useState<View>('title');
 
+  if (view === 'characters') {
+    const characters = Object.values(CHARACTERS);
+    return (
+      <div style={ROOT_STYLE}>
+        <h2 style={{ margin: 0, fontSize: 36, letterSpacing: 4 }}>CHOOSE YOUR CHARACTER</h2>
+        <div style={GRID_STYLE}>
+          {characters.map((c) => (
+            <CharacterCard key={c.id} char={c} onPick={() => startRun(c.id)} />
+          ))}
+        </div>
+        <button onClick={() => setView('title')} style={SECONDARY_BUTTON}>
+          ← Back
+        </button>
+      </div>
+    );
+  }
+
+  // Title view (default)
   return (
     <div style={ROOT_STYLE}>
-      <h1 style={{ margin: 0, fontSize: 56, letterSpacing: 4 }}>HOLLOWSURV</h1>
-      <div style={{ fontSize: 14, opacity: 0.75, marginTop: -16 }}>Choose your character</div>
-
-      <div style={GRID_STYLE}>
-        {characters.map((c) => (
-          <CharacterCard key={c.id} char={c} onPick={() => startRun(c.id)} />
-        ))}
-      </div>
-
+      <h1 style={{ margin: 0, fontSize: 72, letterSpacing: 6 }}>HOLLOWSURV</h1>
+      <button onClick={() => setView('characters')} style={PRIMARY_BUTTON}>
+        Start Run
+      </button>
       <div
         style={{
           display: 'flex',
