@@ -132,7 +132,8 @@ export class ArenaScene extends Phaser.Scene {
     useRunStore.setState((s) => ({ player: { ...s.player, eid } }));
 
     // 5. Render placeholder for the player. Depth 100 keeps player on top of
-    //    auras (depth 5), enemies/projectiles/pickups (default 0).
+    //    auras (depth 5), enemies/projectiles/pickups (default 0). Color from
+    //    selected character (defaults to the tan Ranger color).
     this.playerSprite = this.add.rectangle(
       PLAYER_SPAWN_X,
       PLAYER_SPAWN_Y,
@@ -141,6 +142,20 @@ export class ArenaScene extends Phaser.Scene {
       PLAYER_PLACEHOLDER_COLOR
     );
     this.playerSprite.setDepth(100);
+
+    // Sync player color to selected character when it changes (or first paint).
+    const applyTint = (id: string): void => {
+      // Lazy import via globalThis to avoid pulling content/characters into the
+      // scene module. Falls back to the default color if not yet loaded.
+      const sprite = this.playerSprite;
+      if (!sprite) return;
+      // Dynamic require (Vite handles ESM):
+      void import('../content/characters').then(({ getCharacter }) => {
+        sprite.fillColor = getCharacter(id).tint;
+      });
+    };
+    applyTint(useRunStore.getState().selectedCharacterId);
+    useRunStore.subscribe((s) => applyTint(s.selectedCharacterId));
 
     // 6. Wire input + camera (one-shot binds; systems read these each tick).
     bindInput(this, eid);

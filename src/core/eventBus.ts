@@ -20,6 +20,7 @@ export type GameEvent =
   | { type: 'run_won'; timeMs: number; level: number; kills: number }
   | { type: 'run_lost'; timeMs: number; level: number; kills: number }
   | { type: 'upgrade_chosen'; choiceId: string }
+  | { type: 'character_selected'; characterId: string }
   | { type: 'pause_requested' }
   | { type: 'resume_requested' };
 

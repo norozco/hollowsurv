@@ -62,6 +62,7 @@ import {
   weaponLevelEffect,
 } from '../../content/weapons';
 import { UPGRADES } from '../../content/upgrades';
+import { getCharacter } from '../../content/characters';
 import { useRunStore } from '../../stores/runStore';
 import type { Component } from 'bitecs';
 import type { World } from '../world';
@@ -271,6 +272,35 @@ function ensureUpgradeSubscription(): void {
         Health.maxHp[playerEid] ?? 100,
         (Health.hp[playerEid] ?? 100) + aug.maxHpDelta,
       );
+    }
+  });
+
+  eventBus.on('character_selected', (e) => {
+    const world = _lastWorld;
+    if (!world) return;
+    const players = playerQuery(world);
+    if (players.length === 0) return;
+    const playerEid = players[0]!;
+
+    const character = getCharacter(e.characterId);
+    const b = character.bonuses;
+
+    // Reset stats to 1.0 baseline first so picking a different character mid-session
+    // doesn't compound. Augments picked later in pickUpgrade re-multiply on top.
+    Stats.damageMul[playerEid] = 1;
+    Stats.attackSpeedMul[playerEid] = 1;
+    Stats.moveSpeedMul[playerEid] = 1;
+    Stats.pickupRadiusMul[playerEid] = 1;
+
+    if (b.damageMul) Stats.damageMul[playerEid] *= b.damageMul;
+    if (b.attackSpeedMul) Stats.attackSpeedMul[playerEid] *= b.attackSpeedMul;
+    if (b.moveSpeedMul) Stats.moveSpeedMul[playerEid] *= b.moveSpeedMul;
+    if (b.pickupRadiusMul) Stats.pickupRadiusMul[playerEid] *= b.pickupRadiusMul;
+
+    if (b.maxHpDelta) {
+      const newMax = (Health.maxHp[playerEid] ?? 100) + b.maxHpDelta;
+      Health.maxHp[playerEid] = newMax;
+      Health.hp[playerEid] = newMax; // full heal at run start
     }
   });
 }

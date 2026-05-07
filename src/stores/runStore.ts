@@ -11,6 +11,7 @@
 import { create } from 'zustand';
 import { UPGRADES } from '../content/upgrades';
 import { WEAPONS } from '../content/weapons';
+import { CHARACTERS, DEFAULT_CHARACTER_ID, getCharacter } from '../content/characters';
 import { useMetaStore } from './metaStore';
 import { eventBus } from '../core/eventBus';
 import type { GameEvent } from '../core/eventBus';
@@ -69,11 +70,15 @@ export interface RunState {
   kills: number;
   bossKilled: boolean;
 
+  /** ID of the character chosen for the current/last run (default 'ranger'). */
+  selectedCharacterId: string;
+
   // level-up modal
   pendingChoices: UpgradeChoice[]; // length 0 or 3
 
   // actions
-  startRun: () => void;
+  /** Start a run with the given character. characterId must exist in CHARACTERS or fallback. */
+  startRun: (characterId?: string) => void;
   endRun: (outcome: 'won' | 'lost') => void;
   setPhase: (phase: RunPhase) => void;
   pickUpgrade: (choiceId: string) => void;
@@ -258,20 +263,36 @@ export const useRunStore = create<RunState>((set, get) => ({
   kills: 0,
   bossKilled: false,
   pendingChoices: [],
+  selectedCharacterId: DEFAULT_CHARACTER_ID,
 
-  startRun: () => {
-    // Preserve `eid` if ArenaScene has already spawned the player and written
-    // it back. Resetting eid mid-run would orphan the ECS entity from the HUD.
+  startRun: (characterIdRaw) => {
     const cur = get();
+    const characterId = characterIdRaw ?? DEFAULT_CHARACTER_ID;
+    const character = getCharacter(characterId);
+    const startingWeaponId = WEAPONS[character.startingWeaponId]
+      ? character.startingWeaponId
+      : 'auto-pistol';
+
+    const baseMaxHp = INITIAL_PLAYER.maxHp + (character.bonuses.maxHpDelta ?? 0);
     set({
       phase: 'playing',
       runStartedAtMs: performance.now(),
       elapsedMs: 0,
-      player: { ...INITIAL_PLAYER, eid: cur.player.eid, weapons: [] },
+      player: {
+        ...INITIAL_PLAYER,
+        eid: cur.player.eid,
+        weapons: [{ id: startingWeaponId, level: 1, evolved: false }],
+        hp: baseMaxHp,
+        maxHp: baseMaxHp,
+      },
       kills: 0,
       bossKilled: false,
       pendingChoices: [],
+      selectedCharacterId: characterId,
     });
+
+    // Let ECS systems apply the character's stat bonuses to the player Stats component.
+    eventBus.emit({ type: 'character_selected', characterId });
   },
 
   endRun: (outcome) => {
