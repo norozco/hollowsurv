@@ -28,7 +28,8 @@ export type WeaponArchetype =
   | 'boomerang'
   | 'orbiter'
   | 'mortar'
-  | 'shotgun';
+  | 'shotgun'
+  | 'melee';
 
 export interface WeaponLevelEffect {
   level: number; // 1..N (vertical slice ships 1..5)
@@ -66,6 +67,12 @@ export interface WeaponDefinition {
 
   // Hitbox radius for spawned projectiles (auto_projectile only). Aura uses radius.
   hitboxRadius?: number;
+
+  /**
+   * If set, this weapon is only available when playing as the named character.
+   * Filters the level-up offer pool. Other characters never see it.
+   */
+  restrictedToCharacter?: string;
 
   // Behavior. Called by autoAttackSystem if it ever wants to delegate to the
   // weapon definition itself. v1 dispatches by archetype directly so the
@@ -205,6 +212,12 @@ const SHOTGUN_PIERCE = 1;
 const SHOTGUN_HITBOX_RADIUS = 7;
 const SHOTGUN_TINT = 0xffd266;
 
+// --- Blade: Brawler's signature melee strike. Only triggers when enemies are close.
+const BLADE_BASE_DAMAGE = 24;
+const BLADE_BASE_COOLDOWN_MS = 600;
+const BLADE_BASE_RADIUS = 80;
+const BLADE_TINT = 0xff4a4a;
+
 // `evolvesTo` / `evolveRequires` are omitted entirely (not set to undefined)
 // because `exactOptionalPropertyTypes` distinguishes "missing" from "explicit
 // undefined" for optional fields with non-undefined declared types.
@@ -213,6 +226,7 @@ const autoPistol: WeaponDefinition = {
   name: 'Auto Pistol',
   description: 'Auto-fires bullets at the nearest enemy. Reliable, single-target.',
   archetype: 'auto_projectile',
+  restrictedToCharacter: 'ranger',
   baseDamage: AUTO_PISTOL_BASE_DAMAGE,
   baseCooldownMs: AUTO_PISTOL_BASE_COOLDOWN_MS,
   tint: AUTO_PISTOL_TINT,
@@ -376,6 +390,23 @@ const shotgun: WeaponDefinition = {
   behavior: noopBehavior,
 };
 
+const blade: WeaponDefinition = {
+  id: 'blade',
+  name: 'Blade',
+  description: 'A close-range strike that flashes out when enemies press in. Brawler only.',
+  archetype: 'melee',
+  baseDamage: BLADE_BASE_DAMAGE,
+  baseCooldownMs: BLADE_BASE_COOLDOWN_MS,
+  tint: BLADE_TINT,
+  restrictedToCharacter: 'brawler',
+  levels: buildLevels(BLADE_BASE_DAMAGE, BLADE_BASE_COOLDOWN_MS, 'melee', (lv, eff) => {
+    eff.radius = BLADE_BASE_RADIUS + (lv - 1) * 8;
+    eff.tickRateMs = eff.cooldownMs;
+    eff.pierce = -1;
+  }),
+  behavior: noopBehavior,
+};
+
 export const WEAPONS: Record<string, WeaponDefinition> = {
   [autoPistol.id]: autoPistol,
   [aura.id]: aura,
@@ -386,6 +417,7 @@ export const WEAPONS: Record<string, WeaponDefinition> = {
   [sawblade.id]: sawblade,
   [mortar.id]: mortar,
   [shotgun.id]: shotgun,
+  [blade.id]: blade,
 };
 
 // Slow side-channel — frost_nova writes; flowfield reads. Indexed by enemy eid.

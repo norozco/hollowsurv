@@ -428,6 +428,9 @@ function fireWeapon(
   if (def.archetype === 'shotgun') {
     return fireShotgunWeapon(world, def, ownerEid, level, dmgMul, enemyHash);
   }
+  if (def.archetype === 'melee') {
+    return fireBladeWeapon(world, def, ownerEid, level, dmgMul, enemyHash);
+  }
   return false;
 }
 
@@ -1090,6 +1093,93 @@ function fireShotgunWeapon(
 
   eventBus.emit({ type: 'weapon_fired', weaponId: def.id, source: ownerEid, targetEid: target });
   return true;
+}
+
+// --- blade (melee): only triggers when an enemy is in range --------------
+
+function fireBladeWeapon(
+  world: World,
+  def: WeaponDefinition,
+  ownerEid: number,
+  level: number,
+  dmgMul: number,
+  enemyHash: ReturnType<typeof getEnemyHash>,
+): boolean {
+  const lvEffect = weaponLevelEffect(def, level);
+  const radius = lvEffect.radius ?? 80;
+  const ox = Position.x[ownerEid] ?? 0;
+  const oy = Position.y[ownerEid] ?? 0;
+
+  // Only "fire" if at least one enemy is in range. Returning false keeps the
+  // cooldown at 0 so the strike happens the instant something gets close.
+  growIdBuffer(64);
+  enemyHash.queryRadius(ox, oy, radius, scratchIdBuffer);
+  if (scratchIdBuffer.length === 0) return false;
+
+  const damageAmount = lvEffect.damage * dmgMul;
+  let strikePos: { x: number; y: number } | null = null;
+
+  for (let i = 0; i < scratchIdBuffer.length; i++) {
+    const eid = scratchIdBuffer[i];
+    if (eid === undefined) continue;
+    if (hasComponent(world, Dead, eid)) continue;
+    const curHp = Health.hp[eid] ?? 0;
+    if (curHp <= 0) continue;
+    const next = curHp - damageAmount;
+    Health.hp[eid] = next;
+    if (!strikePos) {
+      strikePos = { x: Position.x[eid] ?? ox, y: Position.y[eid] ?? oy };
+    }
+    eventBus.emit({ type: 'damage_dealt', target: eid, source: ownerEid, amount: damageAmount, isCrit: false });
+    if (next <= 0) {
+      const ex = Position.x[eid] ?? 0;
+      const ey = Position.y[eid] ?? 0;
+      eventBus.emit({ type: 'enemy_killed', enemy: eid, killer: ownerEid, position: { x: ex, y: ey } });
+      ensureComponent(world, Dead, eid);
+    }
+  }
+
+  // Strike visual: a brief slash arc at the player position toward the first hit enemy.
+  spawnBladeSlashVisual(ox, oy, strikePos ?? { x: ox + radius, y: oy }, radius, def.tint);
+
+  eventBus.emit({ type: 'weapon_fired', weaponId: def.id, source: ownerEid, targetEid: 0 });
+  return true;
+}
+
+function spawnBladeSlashVisual(
+  ox: number,
+  oy: number,
+  toward: { x: number; y: number },
+  radius: number,
+  tint: number,
+): void {
+  const scene = findAuraScene();
+  if (!scene) return;
+  // A short, fast crescent-like swoosh: a thin arc that expands and fades.
+  const angle = Math.atan2(toward.y - oy, toward.x - ox);
+  const length = radius * 0.9;
+  const startX = ox + Math.cos(angle) * 14;
+  const startY = oy + Math.sin(angle) * 14;
+  const endX = ox + Math.cos(angle) * length;
+  const endY = oy + Math.sin(angle) * length;
+  const line = scene.add.line(0, 0, startX, startY, endX, endY, tint, 0.95).setOrigin(0, 0).setDepth(50);
+  line.setLineWidth(5);
+  scene.tweens.add({
+    targets: line,
+    alpha: 0,
+    duration: 160,
+    onComplete: () => line.destroy(),
+  });
+  // Tiny burst at the strike location.
+  const burst = scene.add.circle(toward.x, toward.y, 1, tint, 0.7).setDepth(50).setScale(4);
+  scene.tweens.add({
+    targets: burst,
+    scale: 18,
+    alpha: 0,
+    duration: 200,
+    ease: 'Cubic.out',
+    onComplete: () => burst.destroy(),
+  });
 }
 
 // --- helpers --------------------------------------------------------------

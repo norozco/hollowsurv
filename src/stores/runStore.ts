@@ -168,13 +168,17 @@ function pickN<T>(arr: readonly T[], n: number): T[] {
  * Always returns 3 entries when possible. Falls back to augment-only when no
  * weapon offers are available.
  */
-function generateOffers(player: RunState['player']): UpgradeChoice[] {
+function generateOffers(player: RunState['player'], characterId: string): UpgradeChoice[] {
   const ownedIds = new Set(player.weapons.map((w) => w.id));
   const weaponNames = new Map<string, string>();
 
-  // Prefer real WEAPONS data if populated, else placeholder pool.
+  // Prefer real WEAPONS data if populated, else placeholder pool. Filter out
+  // weapons restricted to OTHER characters so a Brawler never sees the Auto
+  // Pistol (Ranger-only) and a Ranger never sees the Blade (Brawler-only).
   const weaponPool = Object.keys(WEAPONS).length > 0
-    ? Object.values(WEAPONS).map((w) => ({ id: w.id, name: w.name, description: w.description }))
+    ? Object.values(WEAPONS)
+        .filter((w) => !w.restrictedToCharacter || w.restrictedToCharacter === characterId)
+        .map((w) => ({ id: w.id, name: w.name, description: w.description }))
     : PLACEHOLDER_WEAPON_POOL.map((w) => ({ id: w.id, name: w.name, description: '' }));
   for (const w of weaponPool) weaponNames.set(w.id, w.name);
 
@@ -426,7 +430,7 @@ export const useRunStore = create<RunState>((set, get) => ({
           };
 
           if (leveledUp) {
-            const offers = generateOffers(nextPlayer);
+            const offers = generateOffers(nextPlayer, cur.selectedCharacterId);
             set({
               player: nextPlayer,
               pendingChoices: offers,
@@ -448,7 +452,7 @@ export const useRunStore = create<RunState>((set, get) => ({
         // Authoritative level-up event from xpSystem. Generate offers if we
         // don't already have pending choices for this level.
         if (cur.pendingChoices.length === 0) {
-          const offers = generateOffers(cur.player);
+          const offers = generateOffers(cur.player, cur.selectedCharacterId);
           set({
             player: { ...cur.player, level: event.newLevel },
             pendingChoices: offers,
