@@ -2,6 +2,8 @@
 
 Status snapshot for picking up after a reboot or new Claude session.
 
+> **Standing rule (per user, 2026-05-14):** This file is the source of truth for project state. After **every** code, config, or content change — even small ones — update this file in the same turn. Don't wait to be asked. Sections that drift fast: file map, tick order, event bus, store fields, content counts, known issues, critical bugs fixed. If you finish a turn without touching RESUME.md, ask yourself whether you really didn't change anything that belongs here.
+
 ## TL;DR
 
 A feature-complete bullet-heaven survivors-like, post-CTO-audit hardened.
@@ -132,17 +134,19 @@ Post-CTO-audit hardening pass:
 ## Architecture
 
 ### Tick order (in `ArenaScene.update`)
-`input → flowfield → movement → spawnDirector → autoAttack → projectile → collision → damage → pickup → xp → lifetime → bargain → hollowMechanics → camera → render`
+`input → flowfield → movement → spawnDirector → autoAttack → projectile → collision → hollowMechanics → pickup → xp → lifetime → bargain → camera → batchedRender`
+
+(`damage` system was removed in Phase 2A — every damage source tags `Dead` + emits `enemy_killed`/`run_lost` inline.)
 
 ### Stores
-- **runStore** — in-run mutable: phase, player (HP/stats/weapons/augment fields/pickedAugmentIds), elapsedMs, runStartedAtMs, selectedCharacterId, runEpithet, kills, pendingChoices, pendingBargain, bargainBoosts, pendingBuildSnapshot, isDailyMode, dailySeed, selectedHollowId, hollowChoicePending
-- **metaStore** — persistent (localStorage `hollowsurv.save.v1`): see schema above
+- **runStore** — in-run mutable. Player slot now includes augment fields: `lifestealPerKill`, `critChance`, `splashRadius`, `thornsReflect`, `knockbackPx`, `berserkerMul`, `damageReduction`, `pickedAugmentIds`. Run-level: `kills`, `bossKilled`, `comboCount`, `comboPeakThisRun`, `comboExpiresAtMs`, `damageDealtTotal`, `damageTakenTotal`, `lastKillerEid`, `lastKillerName`, `selectedCharacterId`, `runEpithet`, `pendingChoices`, `pendingBuildSnapshot`, `pendingBargain`, `bargainBoosts`, `isDailyMode`, `dailySeed`, `selectedHollowId`, `hollowChoicePending`.
+- **metaStore** — persistent (localStorage `hollowsurv.save.v1`): see schema above.
 
 ### RunPhase union
-`'menu' | 'playing' | 'levelup' | 'paused' | 'won' | 'lost' | 'hollow_select'`
+`'menu' | 'playing' | 'levelup' | 'hollow_select' | 'paused' | 'won' | 'lost'`
 
 ### Event bus
-Game events: `enemy_killed`, `damage_dealt`, `player_hit`, `level_up`, `pickup_collected`, `weapon_fired`, `projectile_spawned`, `wave_started`, `boss_spawned`, `run_won`, `run_lost`, `upgrade_chosen`, `character_selected`, `pause_requested`, `resume_requested`, `synergy_activated`, `bargain_offered`, `bargain_accepted`, `bargain_passed`, `hollow_choice_offered`, `hollow_chosen`.
+Game events: `enemy_killed`, `damage_dealt`, `player_hit`, `level_up`, `pickup_collected`, `weapon_fired`, `projectile_spawned`, `wave_started`, `boss_spawned`, `run_won`, `run_lost`, `upgrade_chosen`, `character_selected`, `pause_requested`, `resume_requested`, `synergy_activated`, `bargain_offered`, `bargain_accepted`, `bargain_passed`, `hollow_choice_offered`, `hollow_chosen`, `weapon_evolved`.
 
 ## File map
 
@@ -199,6 +203,11 @@ src/
 3. HMR state pollution — always test in a fresh tab after multi-edit sessions
 4. Augment effects not applied — `pickUpgrade` now applies + emits `upgrade_chosen` for ECS Stats
 5. `bestRunTimeMs` only on wins — now records longest survival regardless of outcome
+6. Pause didn't actually pause — fixed by `scene.tweens.pauseAll()` + `scene.time.paused = true` + voice queue gated on `phase === 'playing'` (Phase 1B)
+7. `Math.random` leaked into determinism-critical paths (crit roll, heal drop, bargain pick, Chainstrike crit) — all replaced with `rng()` (Phase 1A)
+8. Non-projectile kill paths didn't fire `run_won` for bosses — aura/frost/lightning/orbiter/hollow-curse/Hollowfield kills now route through `emitRunWonIfBoss(world, eid)` (Phase 3A)
+9. Music referenced nonexistent `'idle'` phase — RunPhase doesn't include `'idle'`; state machine fixed
+10. Pause time leaked into elapsedMs — ArenaScene records `pauseStartedAtMs` and shifts `runStartedAtMs` forward on resume
 
 ## Known issues / TODO
 
