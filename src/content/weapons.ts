@@ -243,8 +243,14 @@ const SHOTGUN_HITBOX_RADIUS = 7;
 const SHOTGUN_TINT = 0xffd266;
 
 // --- Blade: Brawler's signature melee strike. Only triggers when enemies are close.
-// Balance pass: 24 -> 12 dmg. It hits ALL enemies in 80px radius — was massively overtuned.
-const BLADE_BASE_DAMAGE = 12;
+// Balance history:
+//   24 -> 12 dmg (first pass): 24 was overtuned because it hit ALL enemies in 80px.
+//   12 -> 16 dmg (current):    12 made Brawler functionally identical to Ranger on
+//     per-enemy damage despite eating melee risk + the post-separation flowfield
+//     making "5 enemies in 80px" hard to engineer. 16 is a +33% melee-risk premium
+//     (mirrors Vampire Survivors' Whip-vs-Wand ratio) without bringing back the
+//     crowd-deletion problem of 24. Auto-scales Reaper's Edge via *2.
+const BLADE_BASE_DAMAGE = 16;
 const BLADE_BASE_COOLDOWN_MS = 600;
 const BLADE_BASE_RADIUS = 80;
 const BLADE_TINT = 0xff4a4a;

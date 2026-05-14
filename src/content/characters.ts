@@ -59,7 +59,7 @@ export const CHARACTERS: Record<string, CharacterDefinition> = {
   brawler: {
     id: 'brawler',
     name: 'Brawler',
-    description: 'Melee fighter. Strikes with a Blade when enemies close in. +30 max HP, +10% move speed.',
+    description: 'Melee fighter. The Blade hits harder than any pistol — but only when enemies close in. +30 max HP, +10% move speed.',
     tint: 0xd96a3c, // burnt orange
     startingWeaponId: 'blade',
     bonuses: {

@@ -47,7 +47,7 @@ Vite 8 + Phaser 4.1 + bitECS 0.3.40 + React 19 + Zustand 5 + TypeScript strict.
 | sawblade | orbiter | — | 5 dmg/blade, 1-5 blades |
 | mortar | mortar | — | 22 dmg + 90px AoE |
 | shotgun | shotgun | — | 7 dmg × 3-7 pellets |
-| blade | melee | brawler | 12 dmg, 80px radius, on-proximity |
+| blade | melee | brawler | 16 dmg, 80–112px radius, hits all in range |
 | tome | orbiter | witch | 6 dmg/tome, arcane purple |
 | longshot | auto_projectile | sniper | 30 dmg, 1500ms cd, pierces 1 |
 | hollow-curse | aura | cursed-one | 14 dmg, 50px radius L1 |
@@ -208,6 +208,7 @@ src/
 8. Non-projectile kill paths didn't fire `run_won` for bosses — aura/frost/lightning/orbiter/hollow-curse/Hollowfield kills now route through `emitRunWonIfBoss(world, eid)` (Phase 3A)
 9. Music referenced nonexistent `'idle'` phase — RunPhase doesn't include `'idle'`; state machine fixed
 10. Pause time leaked into elapsedMs — ArenaScene records `pauseStartedAtMs` and shifts `runStartedAtMs` forward on resume
+11. Brawler felt identical to Ranger on per-enemy DPS despite eating melee risk — Blade base 12 → 16 (+33%, matches the VS Whip-vs-Wand ratio); Reaper's Edge auto-scales via `* 2`
 
 ## Known issues / TODO
 
