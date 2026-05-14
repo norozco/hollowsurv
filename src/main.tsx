@@ -4,6 +4,7 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import Phaser from 'phaser';
 import { eventBus } from './core/eventBus';
+import { subscribeVoice } from './core/audio';
 import { useRunStore } from './stores/runStore';
 import { BootScene } from './scenes/BootScene';
 import { ArenaScene } from './scenes/ArenaScene';
@@ -65,4 +66,7 @@ window.addEventListener('keydown', (ev) => {
   }
 });
 
-// 5. C5 menu is wired — runStore starts in 'menu' phase. Start Run button transitions to 'playing'.
+// 5. Subscribe the voice/audio layer to game events.
+subscribeVoice();
+
+// 6. C5 menu is wired — runStore starts in 'menu' phase. Start Run button transitions to 'playing'.
