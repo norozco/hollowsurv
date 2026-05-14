@@ -37,8 +37,12 @@ import { xpSystem } from '../ecs/systems/xp';
 import { lifetimeSystem } from '../ecs/systems/lifetime';
 import { bindCamera, cameraSystem, unbindCamera } from '../ecs/systems/camera';
 import { renderSystem } from '../ecs/systems/render';
+import { bargainSystem } from '../ecs/systems/bargain';
+import { hollowMechanicsSystem } from '../ecs/systems/hollowMechanics';
+import { HOLLOWS } from '../content/hollows';
 import { useRunStore } from '../stores/runStore';
 import type { RunPhase } from '../stores/runStore';
+import { useMetaStore } from '../stores/metaStore';
 
 /** Player spawn position (arena center). */
 const PLAYER_SPAWN_X = ARENA_SIZE_PX / 2;
@@ -62,6 +66,16 @@ export class ArenaScene extends Phaser.Scene {
   /** Placeholder visual for the player. Real sprite arrives later. */
   private playerSprite: Phaser.GameObjects.Rectangle | null = null;
   private playerEid: number = -1;
+  /** runStartedAtMs of the run we last announced; prevents double-firing on
+   *  HMR / phase wobble (e.g. playing -> levelup -> playing). */
+  private lastAnnouncedRunStartedAtMs: number = 0;
+  /** Background fill rectangle. We tint this when a Hollow is picked so the
+   *  arena palette shifts without touching the global camera tint. */
+  private backgroundFill: Phaser.GameObjects.Rectangle | null = null;
+  /** Default background tint (so we can restore on next run start). */
+  private readonly backgroundDefaultTint = 0x0a0a12;
+  /** Last selectedHollowId we applied a tint for; null = default tint active. */
+  private lastAppliedHollowId: string | null = null;
 
   constructor() {
     super({ key: 'ArenaScene' });
@@ -72,9 +86,16 @@ export class ArenaScene extends Phaser.Scene {
     const world = createGameWorld();
     this.world = world;
 
-    // 2. Background — dark fill the size of the arena.
-    this.add
-      .rectangle(ARENA_SIZE_PX / 2, ARENA_SIZE_PX / 2, ARENA_SIZE_PX, ARENA_SIZE_PX, 0x0a0a12)
+    // 2. Background — dark fill the size of the arena. Kept on the scene so
+    //    the Hollow palette tinting code can recolor it when the player picks.
+    this.backgroundFill = this.add
+      .rectangle(
+        ARENA_SIZE_PX / 2,
+        ARENA_SIZE_PX / 2,
+        ARENA_SIZE_PX,
+        ARENA_SIZE_PX,
+        this.backgroundDefaultTint
+      )
       .setStrokeStyle(2, 0x222233);
 
     // 2b. Grid overlay so player can perceive motion (placeholder; replaced by tilemap later).
@@ -162,10 +183,38 @@ export class ArenaScene extends Phaser.Scene {
     bindCamera(this, this.playerSprite, eid);
 
     // 7. Phase mirror — read once now, subscribe for updates.
+    //    Also detect run-start transitions to show the announcement overlay.
     this.phaseMirror = useRunStore.getState().phase;
     this.unsubscribePhase = useRunStore.subscribe((s) => {
+      const prev = this.phaseMirror;
       this.phaseMirror = s.phase;
+      // Announcement fires on entering 'playing' with a fresh runStartedAtMs.
+      // Comparing against lastAnnouncedRunStartedAtMs prevents double-firing
+      // when phase wobbles (playing -> levelup -> playing) within one run.
+      if (
+        s.phase === 'playing' &&
+        prev !== 'playing' &&
+        s.runStartedAtMs > 0 &&
+        s.runStartedAtMs !== this.lastAnnouncedRunStartedAtMs
+      ) {
+        this.lastAnnouncedRunStartedAtMs = s.runStartedAtMs;
+        this.showRunAnnouncement();
+      }
+      // Hollow palette: re-tint the background rectangle whenever the selected
+      // Hollow changes (including transitions away from a Hollow on a new run).
+      if (s.selectedHollowId !== this.lastAppliedHollowId) {
+        this.applyHollowPalette(s.selectedHollowId);
+      }
     });
+    // If we entered the scene already in 'playing' (e.g. dev autostart), still
+    // honor the contract.
+    if (this.phaseMirror === 'playing') {
+      const s = useRunStore.getState();
+      if (s.runStartedAtMs > 0 && s.runStartedAtMs !== this.lastAnnouncedRunStartedAtMs) {
+        this.lastAnnouncedRunStartedAtMs = s.runStartedAtMs;
+        this.showRunAnnouncement();
+      }
+    }
 
     // 8. C5 menu wired — do NOT force 'playing'. Wait for Start Run button.
 
@@ -196,11 +245,111 @@ export class ArenaScene extends Phaser.Scene {
     projectileSystem(w, delta); // C3
     collisionSystem(w, delta); // C3
     damageSystem(w, delta); // C3
+    hollowMechanicsSystem(w, delta); // Branching Hollows — per-Hollow per-tick logic.
     pickupSystem(w, delta); // C4
     xpSystem(w, delta); // C4
     lifetimeSystem(w, delta); // C3
+    bargainSystem(w, delta); // Devil's Bargain — offer timer + auto-pass.
     cameraSystem(w, delta);
     renderSystem(w, delta); // C3 (later — SpriteGPULayer)
+  }
+
+  /**
+   * Show the centered "{name}, you are {epithet}." overlay for ~2 seconds.
+   * Fades 0 -> 1 -> 0 (alpha tween in two stages) and self-destroys.
+   *
+   * Anchored to the camera (scrollFactor 0) so it stays centered even though
+   * the camera follows the player. Depth 1000 keeps it above everything.
+   */
+  private showRunAnnouncement(): void {
+    const name = useMetaStore.getState().playerName || 'Stranger';
+    const epithet = useRunStore.getState().runEpithet || 'the Hollow';
+    const message = `${name}, you are ${epithet}.`;
+
+    const cam = this.cameras.main;
+    const cx = cam.width / 2;
+    const cy = cam.height / 2;
+
+    const text = this.add.text(cx, cy, message, {
+      fontFamily: 'system-ui, sans-serif',
+      fontSize: '32px',
+      color: '#ffffff',
+      stroke: '#000000',
+      strokeThickness: 4,
+      align: 'center',
+      shadow: {
+        offsetX: 0,
+        offsetY: 0,
+        color: '#ffffff',
+        blur: 8,
+        stroke: false,
+        fill: true,
+      },
+    });
+    text.setOrigin(0.5);
+    text.setScrollFactor(0); // anchor to camera, not world
+    text.setDepth(1000);
+    text.setAlpha(0);
+
+    // Two-stage tween: fade in 400ms, hold ~1200ms, fade out 400ms, destroy.
+    this.tweens.add({
+      targets: text,
+      alpha: 1,
+      duration: 400,
+      ease: 'Sine.Out',
+      onComplete: () => {
+        this.tweens.add({
+          targets: text,
+          alpha: 0,
+          delay: 1200,
+          duration: 400,
+          ease: 'Sine.In',
+          onComplete: () => {
+            text.destroy();
+          },
+        });
+      },
+    });
+  }
+
+  /**
+   * Recolor the arena background to match the picked Hollow's palette. We tint
+   * the BACKGROUND RECTANGLE (not the camera) — camera tints affect every
+   * GameObject and cost more to revert. When `hollowId` is null the default
+   * dark tint is restored so a fresh run starts neutral.
+   *
+   * Subtle wash: we blend the palette toward the default dark fill so combat
+   * silhouettes stay readable (a full-saturation tint would white-out the
+   * Bone Hollow).
+   */
+  private applyHollowPalette(hollowId: string | null): void {
+    this.lastAppliedHollowId = hollowId;
+    const bg = this.backgroundFill;
+    if (!bg) return;
+    if (hollowId === null) {
+      bg.fillColor = this.backgroundDefaultTint;
+      return;
+    }
+    // Look up the palette tint. Fall back to the default if the id isn't in
+    // HOLLOWS (defensive — pickHollow already validates).
+    const palette = HOLLOWS[hollowId as keyof typeof HOLLOWS]?.paletteTint;
+    if (palette === undefined) {
+      bg.fillColor = this.backgroundDefaultTint;
+      return;
+    }
+    // Blend palette toward the dark default at ~25% palette weight so the
+    // scene reads as "tinted dark" rather than a solid wash.
+    const PAL_WEIGHT = 0.25;
+    const dr = ((this.backgroundDefaultTint >> 16) & 0xff) * (1 - PAL_WEIGHT);
+    const dg = ((this.backgroundDefaultTint >> 8) & 0xff) * (1 - PAL_WEIGHT);
+    const db = (this.backgroundDefaultTint & 0xff) * (1 - PAL_WEIGHT);
+    const pr = ((palette >> 16) & 0xff) * PAL_WEIGHT;
+    const pg = ((palette >> 8) & 0xff) * PAL_WEIGHT;
+    const pb = (palette & 0xff) * PAL_WEIGHT;
+    const r = Math.min(255, Math.floor(dr + pr));
+    const g = Math.min(255, Math.floor(dg + pg));
+    const b = Math.min(255, Math.floor(db + pb));
+    bg.fillColor = (r << 16) | (g << 8) | b;
   }
 
   private handleShutdown(): void {
@@ -217,5 +366,7 @@ export class ArenaScene extends Phaser.Scene {
     eventBus.clear();
     this.playerSprite = null;
     this.playerEid = -1;
+    this.backgroundFill = null;
+    this.lastAppliedHollowId = null;
   }
 }

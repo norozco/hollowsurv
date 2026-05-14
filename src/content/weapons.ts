@@ -161,18 +161,20 @@ const FROST_NOVA_SLOW_FACTOR = 0.6; // 60% speed (was 40% — too punishing)
 
 // --- Lightning: chain damage between enemies
 // Tuning: 700ms cooldown stacked with chains was clearing screens. Slower + less damage.
-const LIGHTNING_BASE_DAMAGE = 7;
+// Balance pass: 7 -> 6 dmg/jump. Crowd-control tier — debuff, not main DPS.
+const LIGHTNING_BASE_DAMAGE = 6;
 const LIGHTNING_BASE_COOLDOWN_MS = 1100;
 const LIGHTNING_CHAIN_RANGE = 220; // px to next jump
 const LIGHTNING_TINT = 0xfff066;
 
 // --- Boomerang: thrown projectile that returns
 // Tuning: infinite pierce on both legs was AOE-overload. Cap pierce at 6.
+// Balance pass: pierce 6 -> 4. Too many enemies hit per throw at base.
 const BOOMERANG_BASE_DAMAGE = 8;
 const BOOMERANG_BASE_COOLDOWN_MS = 950;
 const BOOMERANG_PROJECTILE_SPEED = 800;
 const BOOMERANG_PROJECTILE_LIFETIME_MS = 1400; // out + back
-const BOOMERANG_PIERCE = 6;
+const BOOMERANG_PIERCE = 4;
 const BOOMERANG_HITBOX_RADIUS = 14;
 const BOOMERANG_TINT = 0xff8842;
 
@@ -185,7 +187,8 @@ const PIERCER_HITBOX_RADIUS = 10;
 const PIERCER_TINT = 0xc8ff60;
 
 // --- Sawblade: orbiting blades that damage on contact
-const SAWBLADE_BASE_DAMAGE = 6;
+// Balance pass: 6 -> 5 dmg/orbiter. At L5 five blades = 25 dmg/sec was overtuned.
+const SAWBLADE_BASE_DAMAGE = 5;
 const SAWBLADE_BASE_COOLDOWN_MS = 350; // damage tick interval per orbiter
 const SAWBLADE_BASE_RADIUS = 95; // orbit radius (px)
 const SAWBLADE_HITBOX_RADIUS = 14;
@@ -213,10 +216,36 @@ const SHOTGUN_HITBOX_RADIUS = 7;
 const SHOTGUN_TINT = 0xffd266;
 
 // --- Blade: Brawler's signature melee strike. Only triggers when enemies are close.
-const BLADE_BASE_DAMAGE = 24;
+// Balance pass: 24 -> 12 dmg. It hits ALL enemies in 80px radius — was massively overtuned.
+const BLADE_BASE_DAMAGE = 12;
 const BLADE_BASE_COOLDOWN_MS = 600;
 const BLADE_BASE_RADIUS = 80;
 const BLADE_TINT = 0xff4a4a;
+
+// --- Tome: Witch's signature. Orbiter, like Sawblade but arcane-tinted.
+// 1 tome at L1, +1 per level (1..5).
+const TOME_BASE_DAMAGE = 6;
+const TOME_BASE_COOLDOWN_MS = 380; // damage tick interval per orbiter
+const TOME_BASE_RADIUS = 100; // orbit radius (px)
+const TOME_HITBOX_RADIUS = 14;
+const TOME_TINT = 0x9b59d6; // arcane purple
+const TOME_BASE_COUNT = 1;
+
+// --- Longshot: Sniper's signature. Very slow, very hard-hitting auto-projectile.
+const LONGSHOT_BASE_DAMAGE = 30;
+const LONGSHOT_BASE_COOLDOWN_MS = 1500;
+const LONGSHOT_PROJECTILE_SPEED = 1400;
+const LONGSHOT_PROJECTILE_LIFETIME_MS = 1800;
+const LONGSHOT_PIERCE = 1;
+const LONGSHOT_HITBOX_RADIUS = 8;
+const LONGSHOT_TINT = 0x4a90c9; // steel blue
+
+// --- Hollow Curse: Cursed One's signature. Tight aura, high damage.
+// Tiny radius (50px) makes you fight in melee; high per-tick damage rewards bravery.
+const HOLLOW_CURSE_BASE_DAMAGE = 14;
+const HOLLOW_CURSE_BASE_COOLDOWN_MS = 500;
+const HOLLOW_CURSE_BASE_RADIUS = 50;
+const HOLLOW_CURSE_TINT = 0x6a0044; // dark wine
 
 // `evolvesTo` / `evolveRequires` are omitted entirely (not set to undefined)
 // because `exactOptionalPropertyTypes` distinguishes "missing" from "explicit
@@ -407,6 +436,66 @@ const blade: WeaponDefinition = {
   behavior: noopBehavior,
 };
 
+const tome: WeaponDefinition = {
+  id: 'tome',
+  name: 'Tome',
+  description: 'Arcane tomes circle you, striking what they touch. More tomes each level. Witch only.',
+  archetype: 'orbiter',
+  baseDamage: TOME_BASE_DAMAGE,
+  baseCooldownMs: TOME_BASE_COOLDOWN_MS,
+  tint: TOME_TINT,
+  hitboxRadius: TOME_HITBOX_RADIUS,
+  restrictedToCharacter: 'witch',
+  levels: buildLevels(TOME_BASE_DAMAGE, TOME_BASE_COOLDOWN_MS, 'orbiter', (lv, eff) => {
+    eff.projectileCount = TOME_BASE_COUNT + (lv - 1); // 1, 2, 3, 4, 5 tomes
+    eff.radius = TOME_BASE_RADIUS;
+    eff.pierce = -1;
+  }),
+  behavior: noopBehavior,
+};
+
+const longshot: WeaponDefinition = {
+  id: 'longshot',
+  name: 'Longshot',
+  description: 'A devastating shot from afar. Slow to fire, brutal on contact. Sniper only.',
+  archetype: 'auto_projectile',
+  baseDamage: LONGSHOT_BASE_DAMAGE,
+  baseCooldownMs: LONGSHOT_BASE_COOLDOWN_MS,
+  tint: LONGSHOT_TINT,
+  hitboxRadius: LONGSHOT_HITBOX_RADIUS,
+  restrictedToCharacter: 'sniper',
+  levels: buildLevels(
+    LONGSHOT_BASE_DAMAGE,
+    LONGSHOT_BASE_COOLDOWN_MS,
+    'auto_projectile',
+    (_lv, eff) => {
+      eff.projectileSpeed = LONGSHOT_PROJECTILE_SPEED;
+      eff.projectileCount = 1;
+      eff.pierce = LONGSHOT_PIERCE;
+      eff.homing = false;
+    }
+  ),
+  behavior: noopBehavior,
+};
+
+const hollowCurse: WeaponDefinition = {
+  id: 'hollow-curse',
+  name: 'Hollow Curse',
+  description: 'A tight, vicious aura that withers anything near. Cursed One only.',
+  archetype: 'aura',
+  baseDamage: HOLLOW_CURSE_BASE_DAMAGE,
+  baseCooldownMs: HOLLOW_CURSE_BASE_COOLDOWN_MS,
+  tint: HOLLOW_CURSE_TINT,
+  restrictedToCharacter: 'cursed-one',
+  levels: buildLevels(HOLLOW_CURSE_BASE_DAMAGE, HOLLOW_CURSE_BASE_COOLDOWN_MS, 'aura', (lv, eff) => {
+    // Grows slowly: 50, 58, 66, 74, 82. Still much smaller than regular Aura.
+    eff.radius = HOLLOW_CURSE_BASE_RADIUS + (lv - 1) * 8;
+    eff.tickRateMs = eff.cooldownMs;
+    eff.pierce = -1;
+  }),
+  behavior: noopBehavior,
+};
+
 export const WEAPONS: Record<string, WeaponDefinition> = {
   [autoPistol.id]: autoPistol,
   [aura.id]: aura,
@@ -418,6 +507,9 @@ export const WEAPONS: Record<string, WeaponDefinition> = {
   [mortar.id]: mortar,
   [shotgun.id]: shotgun,
   [blade.id]: blade,
+  [tome.id]: tome,
+  [longshot.id]: longshot,
+  [hollowCurse.id]: hollowCurse,
 };
 
 // Slow side-channel — frost_nova writes; flowfield reads. Indexed by enemy eid.

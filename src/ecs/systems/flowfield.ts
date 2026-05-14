@@ -85,6 +85,23 @@ export function readEnemyBaseSpeed(eid: number): number {
 }
 
 /**
+ * Enemy HP scaling over time. Applied at SPAWN time by spawnDirector.spawnEnemyEntity().
+ * Formula: hpScale = 1 + (minutes_elapsed × 0.10).
+ *   0:00 -> 1.0×   (no scaling)
+ *   1:00 -> 1.1×
+ *   5:00 -> 1.5×
+ *  10:00 -> 2.0×
+ *
+ * Lives here (not in spawnDirector) because flowfield owns the runStore-elapsed
+ * read path conceptually, and other systems can reuse this if needed. Pure
+ * function: no allocations, no side effects.
+ */
+export function getEnemyHpScaleForElapsedMs(elapsedMs: number): number {
+  const minutes = elapsedMs / 60000;
+  return 1 + minutes * 0.10;
+}
+
+/**
  * Initialize the module-level flowfield. Idempotent — safe to call from a scene
  * create() if/when wired in. Other entry points lazily call this on first tick
  * via {@link ensureField}.

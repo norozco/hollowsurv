@@ -9,6 +9,7 @@ import { useRunStore } from './stores/runStore';
 import { BootScene } from './scenes/BootScene';
 import { ArenaScene } from './scenes/ArenaScene';
 import { App } from './react/App';
+import { readBuildFromUrl } from './core/buildCodes';
 
 // 1. Mount React HUD.
 const rootEl = document.getElementById('root');
@@ -70,3 +71,12 @@ window.addEventListener('keydown', (ev) => {
 subscribeVoice();
 
 // 6. C5 menu is wired — runStore starts in 'menu' phase. Start Run button transitions to 'playing'.
+
+// 7. Shareable build code: if the page was loaded with `?b=...`, decode the
+//    snapshot and stash it on the run store. The next startRun() will consume
+//    it (matching by character id, with the snapshot's character id winning if
+//    the caller doesn't pass one).
+const initialBuild = readBuildFromUrl();
+if (initialBuild) {
+  useRunStore.setState({ pendingBuildSnapshot: initialBuild });
+}

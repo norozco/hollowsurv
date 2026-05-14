@@ -57,6 +57,7 @@ import {
   SAWBLADE_ANGULAR_SPEED_RAD_PER_SEC,
   WEAPONS,
   applyFrostSlow,
+  isEnemySlowed,
   weaponDefByNum,
   weaponIdToNum,
   weaponLevelEffect,
@@ -64,6 +65,7 @@ import {
 import { UPGRADES } from '../../content/upgrades';
 import { getCharacter } from '../../content/characters';
 import { useRunStore } from '../../stores/runStore';
+import { hasSynergy, tickSynergies } from './synergies';
 import type { Component } from 'bitecs';
 import type { World } from '../world';
 import type { WeaponDefinition } from '../../content/weapons';
@@ -100,6 +102,9 @@ export function autoAttackSystem(world: World, dtMs: number): void {
   if (store.phase !== 'playing') return;
   _lastWorld = world;
   ensureUpgradeSubscription();
+  // Hidden synergies: cheap O(synergies * weapons) scan. Emits one-shot
+  // 'synergy_activated' events when a pair first completes — wires the toast.
+  tickSynergies();
 
   // 1. Player check (defends against tick 0 before player entity is visible).
   const players = playerQuery(world);
@@ -273,6 +278,20 @@ function ensureUpgradeSubscription(): void {
         (Health.hp[playerEid] ?? 100) + aug.maxHpDelta,
       );
     }
+  });
+
+  // Hollowfield synergy (Aura + Thorns): when the player takes damage, fire
+  // an extra free aura tick around them. Listens for damage_dealt where the
+  // target is the player; cheap O(1) gating with hasSynergy + a player-id check.
+  eventBus.on('damage_dealt', (e) => {
+    if (!hasSynergy('hollowfield')) return;
+    const world = _lastWorld;
+    if (!world) return;
+    const players = playerQuery(world);
+    if (players.length === 0) return;
+    const playerEid = players[0]!;
+    if (e.target !== playerEid) return;
+    triggerHollowfieldPulse(world, playerEid);
   });
 
   eventBus.on('character_selected', (e) => {
@@ -659,7 +678,16 @@ function fireLightningWeapon(
   enemyHash: ReturnType<typeof getEnemyHash>
 ): boolean {
   const lvEffect = weaponLevelEffect(def, level);
-  const chainCount = Math.max(1, lvEffect.projectileCount ?? 3);
+  let chainCount = Math.max(1, lvEffect.projectileCount ?? 3);
+  // Chainstrike synergy (Lightning + Crit): when this fire crits, chain to
+  // 2x the enemies. We roll once per fire so the whole chain is either
+  // "crit-extended" or normal — keeps the visual coherent.
+  if (hasSynergy('chainstrike')) {
+    const critChance = useRunStore.getState().player.critChance;
+    if (critChance > 0 && Math.random() < critChance) {
+      chainCount *= 2;
+    }
+  }
   const baseDmg = lvEffect.damage * dmgMul;
 
   // Start: nearest enemy to player.
@@ -1054,14 +1082,31 @@ function fireShotgunWeapon(
   const lvEffect = weaponLevelEffect(def, level);
   const speed = lvEffect.projectileSpeed ?? 850;
   const lifetimeMs = PROJECTILE_LIFETIME_MS_BY_WEAPON[def.id] ?? 450;
-  const pelletCount = Math.max(1, lvEffect.projectileCount ?? 3);
+  let pelletCount = Math.max(1, lvEffect.projectileCount ?? 3);
   const damageAmount = lvEffect.damage * dmgMul;
 
-  // Spread evenly across a cone centered on baseAngle.
-  const SPREAD = 0.5; // ~30° total
+  // Last Stand synergy (Shotgun + Berserker): below 30% HP, shotgun fires a
+  // full 360 ring of 8 pellets instead of the usual narrow cone.
+  let spread = 0.5; // radians, ~30° total cone by default
+  let fullRing = false;
+  if (hasSynergy('last_stand')) {
+    const player = useRunStore.getState().player;
+    const lowHp = player.maxHp > 0 && player.hp / player.maxHp <= 0.3;
+    if (lowHp) {
+      pelletCount = 8;
+      spread = Math.PI * 2;
+      fullRing = true;
+    }
+  }
   for (let i = 0; i < pelletCount; i++) {
-    const t = pelletCount === 1 ? 0 : i / (pelletCount - 1) - 0.5; // -0.5..0.5
-    const angle = baseAngle + t * SPREAD;
+    let angle: number;
+    if (fullRing) {
+      // Evenly distribute around a full circle.
+      angle = baseAngle + (i / pelletCount) * spread;
+    } else {
+      const t = pelletCount === 1 ? 0 : i / (pelletCount - 1) - 0.5; // -0.5..0.5
+      angle = baseAngle + t * spread;
+    }
     const dirX = Math.cos(angle);
     const dirY = Math.sin(angle);
 
@@ -1116,7 +1161,9 @@ function fireBladeWeapon(
   enemyHash.queryRadius(ox, oy, radius, scratchIdBuffer);
   if (scratchIdBuffer.length === 0) return false;
 
-  const damageAmount = lvEffect.damage * dmgMul;
+  const baseDamage = lvEffect.damage * dmgMul;
+  // Frostbite synergy (Blade + Frost Nova): blade strikes deal 3x to slowed enemies.
+  const frostbiteActive = hasSynergy('frostbite');
   let strikePos: { x: number; y: number } | null = null;
 
   for (let i = 0; i < scratchIdBuffer.length; i++) {
@@ -1125,12 +1172,13 @@ function fireBladeWeapon(
     if (hasComponent(world, Dead, eid)) continue;
     const curHp = Health.hp[eid] ?? 0;
     if (curHp <= 0) continue;
-    const next = curHp - damageAmount;
+    const dmg = frostbiteActive && isEnemySlowed(eid) ? baseDamage * 3 : baseDamage;
+    const next = curHp - dmg;
     Health.hp[eid] = next;
     if (!strikePos) {
       strikePos = { x: Position.x[eid] ?? ox, y: Position.y[eid] ?? oy };
     }
-    eventBus.emit({ type: 'damage_dealt', target: eid, source: ownerEid, amount: damageAmount, isCrit: false });
+    eventBus.emit({ type: 'damage_dealt', target: eid, source: ownerEid, amount: dmg, isCrit: false });
     if (next <= 0) {
       const ex = Position.x[eid] ?? 0;
       const ey = Position.y[eid] ?? 0;
@@ -1187,6 +1235,64 @@ function spawnBladeSlashVisual(
 function ensureComponent(world: World, comp: Component, eid: number): void {
   if (!hasComponent(world, comp, eid)) {
     addComponent(world, comp, eid);
+  }
+}
+
+// --- Hollowfield synergy pulse --------------------------------------------
+// Free aura burst fired when the player takes damage. Reuses aura-style
+// queryRadius logic but bypasses the weapon cooldown — by design, this can
+// chain with the normal aura tick on the same frame.
+function triggerHollowfieldPulse(world: World, playerEid: number): void {
+  // Find the equipped aura weapon (gated already by hasSynergy('hollowfield'),
+  // but defend in case the player swapped it mid-frame).
+  const weapons = useRunStore.getState().player.weapons;
+  let auraSlot: { id: string; level: number } | null = null;
+  for (let i = 0; i < weapons.length; i++) {
+    const w = weapons[i];
+    if (!w) continue;
+    if (w.id === 'aura') { auraSlot = w; break; }
+  }
+  if (!auraSlot) return;
+  const def = WEAPONS[auraSlot.id];
+  if (!def) return;
+  const lvEffect = weaponLevelEffect(def, auraSlot.level);
+  const radius = lvEffect.radius ?? 100;
+  if (radius <= 0) return;
+  const dmgMul = Stats.damageMul[playerEid] ?? 1;
+  const damageAmount = lvEffect.damage * dmgMul;
+
+  const ox = Position.x[playerEid] ?? 0;
+  const oy = Position.y[playerEid] ?? 0;
+
+  // Ensure the spatial hash is current — collisionSystem already rebuilt it
+  // this tick, but the damage_dealt event we're reacting to could fire
+  // mid-pass. Rebuild defensively; it's idempotent.
+  rebuildEnemyHash(world);
+  const enemyHash = getEnemyHash();
+  growIdBuffer(64);
+  enemyHash.queryRadius(ox, oy, radius, scratchIdBuffer);
+
+  for (let i = 0; i < scratchIdBuffer.length; i++) {
+    const eid = scratchIdBuffer[i];
+    if (eid === undefined) continue;
+    if (hasComponent(world, Dead, eid)) continue;
+    const curHp = Health.hp[eid] ?? 0;
+    if (curHp <= 0) continue;
+    const nextHp = curHp - damageAmount;
+    Health.hp[eid] = nextHp;
+    eventBus.emit({
+      type: 'damage_dealt',
+      target: eid,
+      source: playerEid,
+      amount: damageAmount,
+      isCrit: false,
+    });
+    if (nextHp <= 0) {
+      const ex = Position.x[eid] ?? 0;
+      const ey = Position.y[eid] ?? 0;
+      eventBus.emit({ type: 'enemy_killed', enemy: eid, killer: playerEid, position: { x: ex, y: ey } });
+      ensureComponent(world, Dead, eid);
+    }
   }
 }
 

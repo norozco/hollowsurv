@@ -22,7 +22,13 @@ export type GameEvent =
   | { type: 'upgrade_chosen'; choiceId: string }
   | { type: 'character_selected'; characterId: string }
   | { type: 'pause_requested' }
-  | { type: 'resume_requested' };
+  | { type: 'resume_requested' }
+  | { type: 'synergy_activated'; synergyId: string; name: string }
+  | { type: 'bargain_offered'; bargainId: string; title: string }
+  | { type: 'bargain_accepted'; bargainId: string }
+  | { type: 'bargain_passed'; bargainId: string }
+  | { type: 'hollow_choice_offered' }
+  | { type: 'hollow_chosen'; hollowId: string };
 
 export type GameEventType = GameEvent['type'];
 

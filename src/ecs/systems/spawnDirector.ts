@@ -52,10 +52,12 @@ import {
   Stats,
   Velocity,
 } from '../components';
-import { setEnemyBaseSpeed } from './flowfield';
+import { setEnemyBaseSpeed, getEnemyHpScaleForElapsedMs } from './flowfield';
 import { ENEMIES, type EnemyDefinition } from '../../content/enemies';
 import { WAVES, BOSS_SPAWN_MS, DEFAULT_SPAWN_RADIUS, type WaveDef, type WaveFormation } from '../../content/waves';
+import { HOLLOWS, HOLLOW_CHOICE_OFFER_MS } from '../../content/hollows';
 import { useRunStore } from '../../stores/runStore';
+import { rng } from '../../core/rng';
 import type { World } from '../world';
 
 // --- queries -----------------------------------------------------------------
@@ -169,9 +171,13 @@ function offsetForFormation(
       // Spawn within a 90-degree sector centered on formationSeedAngle so the
       // player always has a "safe direction" to flee. Without this the wave
       // statistically forms a ring at high counts (4 enemies cover most of 360°).
+      //
+      // `rng()` is seeded by runStore.startRun() when daily mode is active so
+      // every player today sees the same spawn angles. In normal mode it falls
+      // back to Math.random.
       const SECTOR_RAD = Math.PI / 2; // 90 degrees
-      const angle = formationSeedAngle + (Math.random() - 0.5) * SECTOR_RAD;
-      const r = radius * (0.9 + Math.random() * 0.2);
+      const angle = formationSeedAngle + (rng() - 0.5) * SECTOR_RAD;
+      const r = radius * (0.9 + rng() * 0.2);
       out.dx = Math.cos(angle) * r;
       out.dy = Math.sin(angle) * r;
       return;
@@ -191,7 +197,12 @@ function offsetForFormation(
 const _offsetScratch = { dx: 0, dy: 0 };
 const _playerPosScratch = { x: 0, y: 0 };
 
-/** Spawn a single enemy from a definition at world position (x, y). Returns the eid. */
+/**
+ * Spawn a single enemy from a definition at world position (x, y). Returns the eid.
+ *
+ * Exposed via `spawnEnemyAt()` so the Hollow mechanics system can spawn bone
+ * skeletons on enemy death without duplicating the component-init plumbing.
+ */
 function spawnEnemyEntity(
   world: World,
   scene: Phaser.Scene | null,
@@ -219,8 +230,10 @@ function spawnEnemyEntity(
   Position.y[eid] = y;
   Velocity.vx[eid] = 0;
   Velocity.vy[eid] = 0;
-  Health.hp[eid] = def.hp;
-  Health.maxHp[eid] = def.hp;
+  // Apply elapsed-time HP scaling at spawn (balance pass: +10% per minute).
+  const hpScale = getEnemyHpScaleForElapsedMs(useRunStore.getState().elapsedMs);
+  Health.hp[eid] = def.hp * hpScale;
+  Health.maxHp[eid] = def.hp * hpScale;
   Hitbox.radius[eid] = def.hitboxRadius;
   Damage.amount[eid] = def.damage;
   Stats.moveSpeedMul[eid] = 1.0;
@@ -261,7 +274,20 @@ function recycleEnemy(world: World, eid: number): void {
 
 /** Spawn one wave's worth of enemies. */
 function fireWave(world: World, scene: Phaser.Scene | null, wave: WaveDef): void {
-  const def = ENEMIES[wave.enemy];
+  // Branching Hollows: boss waves substitute the selected Hollow's boss id.
+  // When no Hollow was picked (e.g. the player died before 5:00), we fall back
+  // to the wave's literal `enemy` value (boss-prime).
+  let enemyId = wave.enemy;
+  if (wave.isBoss === true) {
+    const hollowId = useRunStore.getState().selectedHollowId;
+    if (hollowId !== null) {
+      const hollow = HOLLOWS[hollowId];
+      if (hollow && ENEMIES[hollow.bossEnemyId]) {
+        enemyId = hollow.bossEnemyId;
+      }
+    }
+  }
+  const def = ENEMIES[enemyId];
   if (!def) {
     // Unknown enemy id in waves.ts. Skip rather than throw — better to keep
     // the run alive than crash from a content typo.
@@ -270,7 +296,8 @@ function fireWave(world: World, scene: Phaser.Scene | null, wave: WaveDef): void
 
   getPlayerPos(world, _playerPosScratch);
   const radius = wave.radius ?? DEFAULT_SPAWN_RADIUS;
-  const formationSeed = Math.random() * Math.PI * 2;
+  // Seeded via core/rng so daily-mode runs share formation angles across players.
+  const formationSeed = rng() * Math.PI * 2;
 
   const isBoss = wave.isBoss === true;
   const cap = isBoss ? poolCapacity(PoolKind.Boss) : poolCapacity(PoolKind.Enemy);
@@ -341,6 +368,31 @@ export function spawnDirectorSystem(world: World, _dtMs: number): void {
     lastRunStartedAtMs = snapshot.runStartedAtMs;
   }
 
+  // Branching Hollows: at 5:00 the player picks a Hollow. We flip the phase to
+  // 'hollow_select' so every other system (including this one — see the
+  // top-of-fn guard) early-returns until pickHollow() resumes play. We only
+  // fire the offer once per run (gated on selectedHollowId === null AND
+  // hollowChoicePending === false). If the player already picked, both
+  // conditions are false; if the offer's currently up, hollowChoicePending
+  // is true; the next tick won't re-offer because phase !== 'playing'.
+  {
+    const s = useRunStore.getState();
+    if (
+      elapsed >= HOLLOW_CHOICE_OFFER_MS &&
+      s.selectedHollowId === null &&
+      !s.hollowChoicePending
+    ) {
+      useRunStore.setState({
+        hollowChoicePending: true,
+        phase: 'hollow_select',
+      });
+      eventBus.emit({ type: 'hollow_choice_offered' });
+      // Return early: with phase now 'hollow_select' no spawning should happen
+      // this tick anyway, and the top guard will catch us next frame.
+      return;
+    }
+  }
+
   // Detect "boss is currently alive" once per tick — used to gate post-10:00 grunt waves.
   const bossAlive = isBossAlive(world);
 
@@ -385,4 +437,44 @@ export function spawnDirectorSystem(world: World, _dtMs: number): void {
   }
 
   syncVisuals(world);
+}
+
+// --- public spawn helpers (Hollow mechanics) ---------------------------------
+
+/**
+ * Spawn a single enemy of the given archetype id at world position (x, y). Used
+ * by `hollowMechanicsSystem` to summon Bone Hollow skeletons on enemy death.
+ *
+ * Returns the new entity's eid, or -1 if the archetype id is unknown or the
+ * pool is at cap. Visual + flowfield wiring is identical to wave spawns.
+ *
+ * The caller is responsible for any per-Hollow tints/scale overrides (apply
+ * AFTER this call by writing Sprite fields directly).
+ */
+export function spawnEnemyAt(world: World, enemyId: string, x: number, y: number): number {
+  const def = ENEMIES[enemyId];
+  if (!def) return -1;
+  const cap = def.isBoss ? poolCapacity(PoolKind.Boss) : poolCapacity(PoolKind.Enemy);
+  const active = def.isBoss ? poolActiveCount(PoolKind.Boss) : poolActiveCount(PoolKind.Enemy);
+  if (active >= cap) return -1;
+  const scene = getActiveScene();
+  return spawnEnemyEntity(world, scene, def, x, y);
+}
+
+/**
+ * Override the visual tint of a previously-spawned enemy. Useful for Bone
+ * Hollow bonespawns (we recolor a `skirmisher` to white). Writes the Sprite
+ * component AND the placeholder rectangle.
+ */
+export function tintSpawnedEnemy(eid: number, tint: number): void {
+  Sprite.tint[eid] = tint;
+  const rect = visuals.get(eid);
+  if (rect) rect.fillColor = tint;
+}
+
+/** Scale the placeholder visual of a spawned enemy (multiplier; 1 = native). */
+export function scaleSpawnedEnemy(eid: number, scale: number): void {
+  Sprite.scale[eid] = scale;
+  const rect = visuals.get(eid);
+  if (rect) rect.setScale(scale);
 }

@@ -128,6 +128,10 @@ export function subscribeVoice(): void {
   eventBus.on('run_lost', () => playVoice('death'));
   eventBus.on('run_won', () => playVoice('victory'));
 
-  // Bargain hooks fire when the Devil's Bargain system ships — events not yet emitted.
-  // The audio layer is ready; no-op until then.
+  // Bargain hooks — wired alongside the Devil's Bargain system.
+  eventBus.on('bargain_offered', () => playVoice('bargain_offer'));
+  eventBus.on('bargain_accepted', () => playVoice('bargain_accept'));
+
+  // Hollow choice — fires when the 5:00 mark presents the portal screen.
+  eventBus.on('hollow_choice_offered', () => playVoice('hollow_choice'));
 }

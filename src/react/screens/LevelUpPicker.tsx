@@ -6,11 +6,12 @@
 //
 // The modal pointer-events are 'auto' so cards are clickable. The HUD behind
 // us stays mounted (App.tsx routing) so HP/timer remain visible while paused.
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import type { CSSProperties, ReactElement } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useRunStore } from '../../stores/runStore';
 import type { UpgradeChoice } from '../../stores/runStore';
+import { buildShareUrl, snapshotFromRunStore } from '../../core/buildCodes';
 
 const RARITY_BORDER: Record<UpgradeChoice['rarity'], string> = {
   common: '#666',
@@ -52,9 +53,22 @@ const CARD_BASE: CSSProperties = {
   fontFamily: 'inherit',
 };
 
+const COPY_BUTTON_STYLE: CSSProperties = {
+  marginTop: 4,
+  padding: '6px 14px',
+  background: 'transparent',
+  color: '#bbb',
+  border: '1px solid #444',
+  borderRadius: 4,
+  cursor: 'pointer',
+  fontSize: 12,
+  fontFamily: 'inherit',
+};
+
 export function LevelUpPicker(): ReactElement {
   const pendingChoices = useRunStore(useShallow((s) => s.pendingChoices));
   const pickUpgrade = useRunStore((s) => s.pickUpgrade);
+  const [copyMsg, setCopyMsg] = useState<string>('');
 
   // Keyboard 1/2/3 picks the matching card.
   useEffect(() => {
@@ -70,6 +84,27 @@ export function LevelUpPicker(): ReactElement {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [pendingChoices, pickUpgrade]);
+
+  function onCopyBuild(): void {
+    const snapshot = snapshotFromRunStore();
+    const url = buildShareUrl(snapshot);
+    const clipboard = navigator.clipboard;
+    if (clipboard && typeof clipboard.writeText === 'function') {
+      clipboard.writeText(url).then(
+        () => {
+          setCopyMsg('Copied!');
+          window.setTimeout(() => setCopyMsg(''), 1500);
+        },
+        () => {
+          setCopyMsg('Copy failed');
+          window.setTimeout(() => setCopyMsg(''), 1500);
+        }
+      );
+    } else {
+      setCopyMsg('Clipboard unavailable');
+      window.setTimeout(() => setCopyMsg(''), 1500);
+    }
+  }
 
   return (
     <div style={ROOT_STYLE}>
@@ -97,6 +132,9 @@ export function LevelUpPicker(): ReactElement {
         ))}
       </div>
       <div style={{ fontSize: 11, opacity: 0.5 }}>Press 1, 2, or 3 to pick</div>
+      <button onClick={onCopyBuild} style={COPY_BUTTON_STYLE}>
+        {copyMsg || 'Copy Build Code'}
+      </button>
     </div>
   );
 }
