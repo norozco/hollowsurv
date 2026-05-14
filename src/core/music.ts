@@ -122,7 +122,7 @@ function readVolume(): number {
 function pickTrackForState(): string {
   const s = useRunStore.getState();
   const phase = s.phase;
-  if (phase === 'menu' || phase === 'idle') return 'menu';
+  if (phase === 'menu') return 'menu';
   if (phase === 'won') return 'victory';
   if (phase === 'lost') return 'death';
 
