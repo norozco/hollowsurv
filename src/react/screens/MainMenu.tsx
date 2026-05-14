@@ -5,14 +5,14 @@
 //   1. 'title' view — HOLLOWSURV + Start Run / Daily Run + lifetime stats
 //   2. Click Start Run or Daily Run:
 //        - Daily Run sets the "isDailySelect" local flag.
-//        - If metaStore.playerName is empty → go to 'name'
-//        - Else → go straight to 'characters'
+//        - If metaStore.playerName is empty -> go to 'name'
+//        - Else -> go straight to 'characters'
 //      (You can also reach 'name' explicitly via the "Edit name (X)" button.)
-//   3. 'name' view — type name → setPlayerName → 'characters'
-//   4. 'characters' → pick → runStore.startRun(id, { daily: isDailySelect }) → arena
+//   3. 'name' view — type name -> setPlayerName -> 'characters'
+//   4. 'characters' -> pick -> runStore.startRun(id, { daily: isDailySelect }) -> arena
 //
 // Character grid renders ALL CHARACTERS — unlocked first, then locked. Locked
-// cards show a 🔒 plus the unlock condition; the button is disabled.
+// cards show a lock + the unlock condition; the button is disabled.
 //
 // View state is local to this component (resets if MainMenu unmounts/remounts).
 // We don't add new RunPhases because all views are still phase='menu'.
@@ -27,10 +27,12 @@ import {
 } from '../../content/characters';
 import { WEAPONS } from '../../content/weapons';
 import { todaysKey } from '../../core/rng';
+import { t } from '../../content/strings';
 import { NameEntryScreen } from './NameEntryScreen';
+import { SettingsModal } from './SettingsModal';
 
 function formatBestTime(ms: number | null): string {
-  if (ms === null) return '—';
+  if (ms === null) return t('timeDash');
   const total = Math.max(0, Math.floor(ms / 1000));
   const m = Math.floor(total / 60).toString().padStart(2, '0');
   const s = (total % 60).toString().padStart(2, '0');
@@ -114,6 +116,13 @@ const LOCKED_CARD_STYLE: CSSProperties = {
 
 function CharacterCard({ char, onPick }: { char: CharacterDefinition; onPick: () => void }): ReactElement {
   const startWeapon = WEAPONS[char.startingWeaponId]?.name ?? char.startingWeaponId;
+  // `t('startsWith')` returns "Starts with: {weapon}". We split around the
+  // placeholder so the weapon name can sit inside a colored span; if the
+  // placeholder is missing we still render the prefix safely.
+  const raw = t('startsWith');
+  const splitIdx = raw.indexOf('{weapon}');
+  const prefix = splitIdx === -1 ? raw : raw.slice(0, splitIdx);
+  const suffix = splitIdx === -1 ? '' : raw.slice(splitIdx + '{weapon}'.length);
   return (
     <button onClick={onPick} style={CARD_STYLE}>
       <div
@@ -128,14 +137,14 @@ function CharacterCard({ char, onPick }: { char: CharacterDefinition; onPick: ()
       <div style={{ fontSize: 22, fontWeight: 700, letterSpacing: 1 }}>{char.name}</div>
       <div style={{ fontSize: 13, opacity: 0.9, lineHeight: 1.4 }}>{char.description}</div>
       <div style={{ marginTop: 'auto', fontSize: 12, opacity: 0.7, fontVariantNumeric: 'tabular-nums' }}>
-        Starts with: <span style={{ color: '#b9d4ff' }}>{startWeapon}</span>
+        {prefix}<span style={{ color: '#b9d4ff' }}>{startWeapon}</span>{suffix}
       </div>
     </button>
   );
 }
 
 function LockedCharacterCard({ char }: { char: CharacterDefinition }): ReactElement {
-  const condition = char.unlockCondition ?? 'Locked';
+  const condition = char.unlockCondition ?? t('lockedLabel');
   return (
     <button
       style={LOCKED_CARD_STYLE}
@@ -160,13 +169,13 @@ function LockedCharacterCard({ char }: { char: CharacterDefinition }): ReactElem
         {'\u{1F512}'}
       </div>
       <div style={{ fontSize: 22, fontWeight: 700, letterSpacing: 1, color: '#888' }}>
-        ???
+        {t('lockedName')}
       </div>
       <div style={{ fontSize: 13, opacity: 0.9, lineHeight: 1.4, color: '#bbb' }}>
         {condition}
       </div>
       <div style={{ marginTop: 'auto', fontSize: 12, opacity: 0.6, fontVariantNumeric: 'tabular-nums' }}>
-        Locked
+        {t('lockedLabel')}
       </div>
     </button>
   );
@@ -207,6 +216,8 @@ export function MainMenu(): ReactElement {
   // True if the player is on a daily-run flow through character select.
   // Reset to false whenever they bail back to the title.
   const [isDailySelect, setIsDailySelect] = useState<boolean>(false);
+  // Title-screen settings modal. Only shown over the 'title' view.
+  const [showSettings, setShowSettings] = useState<boolean>(false);
 
   // ---------- name entry ----------
   if (view === 'name') {
@@ -237,15 +248,15 @@ export function MainMenu(): ReactElement {
 
     return (
       <div style={ROOT_STYLE}>
-        <h2 style={{ margin: 0, fontSize: 36, letterSpacing: 4 }}>CHOOSE YOUR CHARACTER</h2>
+        <h2 style={{ margin: 0, fontSize: 36, letterSpacing: 4 }}>{t('chooseYourCharacter')}</h2>
         {isDailySelect ? (
           <div style={{ fontSize: 14, opacity: 0.85, marginTop: -8, color: '#a9d8b1' }}>
-            Daily Run — {todayKey}
+            {t('dailyRun')} — {todayKey}
           </div>
         ) : null}
         {playerName ? (
           <div style={{ fontSize: 14, opacity: 0.75, marginTop: -8 }}>
-            Choosing for <span style={{ color: '#b9d4ff' }}>{playerName}</span>
+            {t('choosingForPrefix')}<span style={{ color: '#b9d4ff' }}>{playerName}</span>
           </div>
         ) : null}
         <div style={GRID_STYLE}>
@@ -267,7 +278,7 @@ export function MainMenu(): ReactElement {
           }}
           style={SECONDARY_BUTTON}
         >
-          Back
+          {t('back')}
         </button>
       </div>
     );
@@ -296,36 +307,48 @@ export function MainMenu(): ReactElement {
   };
 
   return (
-    <div style={ROOT_STYLE}>
-      <h1 style={{ margin: 0, fontSize: 72, letterSpacing: 6 }}>HOLLOWSURV</h1>
-      <div style={BUTTON_ROW}>
-        <button onClick={onStartRun} style={PRIMARY_BUTTON}>
-          Start Run
-        </button>
-        <button onClick={onDailyRun} style={DAILY_BUTTON} title={`Daily seed ${todayKey} — same run for everyone today.`}>
-          Daily Run
-        </button>
+    <>
+      <div style={ROOT_STYLE}>
+        <h1 style={{ margin: 0, fontSize: 72, letterSpacing: 6 }}>{t('gameTitle')}</h1>
+        <div style={BUTTON_ROW}>
+          <button onClick={onStartRun} style={PRIMARY_BUTTON}>
+            {t('startRun')}
+          </button>
+          <button
+            onClick={onDailyRun}
+            style={DAILY_BUTTON}
+            title={t('dailyRunHint', { date: todayKey })}
+          >
+            {t('dailyRun')}
+          </button>
+        </div>
+        <div style={{ fontSize: 13, opacity: 0.8, fontVariantNumeric: 'tabular-nums', marginTop: -10 }}>
+          {t('todayBest', { date: todayKey, time: formatBestTime(todaysBestMs) })}
+        </div>
+        <div style={BUTTON_ROW}>
+          <button onClick={() => setView('name')} style={SECONDARY_BUTTON}>
+            {playerName ? `${t('editName')} (${playerName})` : t('setName')}
+          </button>
+          <button onClick={() => setShowSettings(true)} style={SECONDARY_BUTTON}>
+            {t('settings')}
+          </button>
+        </div>
+        <div
+          style={{
+            display: 'flex',
+            gap: 32,
+            marginTop: 8,
+            fontSize: 14,
+            opacity: 0.85,
+            fontVariantNumeric: 'tabular-nums',
+          }}
+        >
+          <span>{t('statRuns', { count: totalRuns })}</span>
+          <span>{t('statWins', { count: totalWins })}</span>
+          <span>{t('statLongest', { time: formatBestTime(bestRunTimeMs) })}</span>
+        </div>
       </div>
-      <div style={{ fontSize: 13, opacity: 0.8, fontVariantNumeric: 'tabular-nums', marginTop: -10 }}>
-        Today ({todayKey}): {formatBestTime(todaysBestMs)}
-      </div>
-      <button onClick={() => setView('name')} style={SECONDARY_BUTTON}>
-        {playerName ? `Edit name (${playerName})` : 'Set name'}
-      </button>
-      <div
-        style={{
-          display: 'flex',
-          gap: 32,
-          marginTop: 8,
-          fontSize: 14,
-          opacity: 0.85,
-          fontVariantNumeric: 'tabular-nums',
-        }}
-      >
-        <span>Runs: {totalRuns}</span>
-        <span>Wins: {totalWins}</span>
-        <span>Longest: {formatBestTime(bestRunTimeMs)}</span>
-      </div>
-    </div>
+      {showSettings ? <SettingsModal onClose={() => setShowSettings(false)} /> : null}
+    </>
   );
 }

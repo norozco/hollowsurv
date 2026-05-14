@@ -42,6 +42,33 @@ export interface WeaponLevelEffect {
   radius?: number; // archetype: aura
   tickRateMs?: number; // aura damage tick interval
   description: string;
+
+  // --- evolution-only flags ----------------------------------------------
+  // These are set on evolved weapons. Base weapons leave them undefined.
+  // autoAttack reads them and threads them through the relevant fire path.
+
+  /**
+   * Phantom Shot. When true, every projectile fired by this weapon is a
+   * guaranteed crit (2x damage) regardless of player.critChance.
+   */
+  forceCrit?: boolean;
+  /**
+   * Reaper's Edge. Melee strikes instantly execute (set hp to 0) any enemy
+   * whose hp drops below `execBelowFrac * maxHp` after the strike's normal
+   * damage is applied. 0.15 = 15% threshold.
+   */
+  execBelowFrac?: number;
+  /**
+   * Carpet Bomb. On mortar detonation, spawn this many sub-mortars at
+   * random offsets around the impact site; each detonates after a short
+   * delay for the standard mortar radius/damage.
+   */
+  subMortarCount?: number;
+  /**
+   * Eternal Return. Boomerang reflects off arena edges this many times
+   * before its lifetime expires. 0 = no reflection (vanilla boomerang).
+   */
+  ricochetCount?: number;
 }
 
 export interface WeaponDefinition {
@@ -260,6 +287,8 @@ const autoPistol: WeaponDefinition = {
   baseCooldownMs: AUTO_PISTOL_BASE_COOLDOWN_MS,
   tint: AUTO_PISTOL_TINT,
   hitboxRadius: AUTO_PISTOL_HITBOX_RADIUS,
+  evolvesTo: 'phantom-shot',
+  evolveRequires: { weaponMaxLevel: true, pairedAugmentId: 'aug-crit' },
   levels: buildLevels(
     AUTO_PISTOL_BASE_DAMAGE,
     AUTO_PISTOL_BASE_COOLDOWN_MS,
@@ -282,6 +311,8 @@ const aura: WeaponDefinition = {
   baseDamage: AURA_BASE_DAMAGE,
   baseCooldownMs: AURA_BASE_COOLDOWN_MS,
   tint: AURA_TINT,
+  evolvesTo: 'hollow-field',
+  evolveRequires: { weaponMaxLevel: true, pairedAugmentId: 'aug-maxhp' },
   levels: buildLevels(AURA_BASE_DAMAGE, AURA_BASE_COOLDOWN_MS, 'aura', (lv, eff) => {
     // Each level grows the radius modestly: +14px per level past 1.
     eff.radius = AURA_BASE_RADIUS + (lv - 1) * 14;
@@ -355,6 +386,8 @@ const boomerang: WeaponDefinition = {
   baseCooldownMs: BOOMERANG_BASE_COOLDOWN_MS,
   tint: BOOMERANG_TINT,
   hitboxRadius: BOOMERANG_HITBOX_RADIUS,
+  evolvesTo: 'eternal-return',
+  evolveRequires: { weaponMaxLevel: true, pairedAugmentId: 'aug-attackspeed' },
   levels: buildLevels(BOOMERANG_BASE_DAMAGE, BOOMERANG_BASE_COOLDOWN_MS, 'boomerang', (lv, eff) => {
     eff.projectileSpeed = BOOMERANG_PROJECTILE_SPEED;
     eff.projectileCount = 1;
@@ -391,6 +424,8 @@ const mortar: WeaponDefinition = {
   baseCooldownMs: MORTAR_BASE_COOLDOWN_MS,
   tint: MORTAR_TINT,
   hitboxRadius: MORTAR_HITBOX_RADIUS,
+  evolvesTo: 'carpet-bomb',
+  evolveRequires: { weaponMaxLevel: true, pairedAugmentId: 'aug-splash' },
   levels: buildLevels(MORTAR_BASE_DAMAGE, MORTAR_BASE_COOLDOWN_MS, 'mortar', (_lv, eff) => {
     eff.projectileSpeed = MORTAR_PROJECTILE_SPEED;
     eff.projectileCount = 1;
@@ -428,6 +463,8 @@ const blade: WeaponDefinition = {
   baseCooldownMs: BLADE_BASE_COOLDOWN_MS,
   tint: BLADE_TINT,
   restrictedToCharacter: 'brawler',
+  evolvesTo: 'reapers-edge',
+  evolveRequires: { weaponMaxLevel: true, pairedAugmentId: 'aug-knockback' },
   levels: buildLevels(BLADE_BASE_DAMAGE, BLADE_BASE_COOLDOWN_MS, 'melee', (lv, eff) => {
     eff.radius = BLADE_BASE_RADIUS + (lv - 1) * 8;
     eff.tickRateMs = eff.cooldownMs;
@@ -496,6 +533,152 @@ const hollowCurse: WeaponDefinition = {
   behavior: noopBehavior,
 };
 
+// --- evolutions ----------------------------------------------------------
+// Five Vampire-Survivors-style evolutions. Each unlocks when the base weapon
+// reaches max level AND the paired augment is owned (see evolveRequires on
+// the base weapon definitions above). The level-up picker surfaces the
+// evolution as an "EVOLVE: <name>" offer; picking it replaces the base
+// weapon at level 1 (with bumped stats baked into the levels table).
+//
+// All evolutions start at level 1 but ship with damage roughly 2x the
+// equivalent base level for the same level entry, plus an evolution-only
+// behavioral flag (forceCrit / execBelowFrac / subMortarCount / ricochetCount)
+// where applicable.
+
+// 1) Phantom Shot — Auto Pistol + Crit. Same projectile pattern, +50%
+//    projectile speed, guaranteed crit on every hit.
+const PHANTOM_SHOT_BASE_DAMAGE = AUTO_PISTOL_BASE_DAMAGE * 2;
+const PHANTOM_SHOT_BASE_COOLDOWN_MS = AUTO_PISTOL_BASE_COOLDOWN_MS;
+const PHANTOM_SHOT_PROJECTILE_SPEED = Math.round(AUTO_PISTOL_PROJECTILE_SPEED * 1.5);
+const PHANTOM_SHOT_PROJECTILE_LIFETIME_MS = AUTO_PISTOL_PROJECTILE_LIFETIME_MS;
+const PHANTOM_SHOT_HITBOX_RADIUS = AUTO_PISTOL_HITBOX_RADIUS + 2;
+const PHANTOM_SHOT_TINT = 0xffd24a; // gold
+
+const phantomShot: WeaponDefinition = {
+  id: 'phantom-shot',
+  name: 'Phantom Shot',
+  description: 'Evolved Pistol. Every shot is a guaranteed crit.',
+  archetype: 'auto_projectile',
+  restrictedToCharacter: 'ranger',
+  baseDamage: PHANTOM_SHOT_BASE_DAMAGE,
+  baseCooldownMs: PHANTOM_SHOT_BASE_COOLDOWN_MS,
+  tint: PHANTOM_SHOT_TINT,
+  hitboxRadius: PHANTOM_SHOT_HITBOX_RADIUS,
+  levels: buildLevels(
+    PHANTOM_SHOT_BASE_DAMAGE,
+    PHANTOM_SHOT_BASE_COOLDOWN_MS,
+    'auto_projectile',
+    (_lv, eff) => {
+      eff.projectileSpeed = PHANTOM_SHOT_PROJECTILE_SPEED;
+      eff.projectileCount = 1;
+      eff.pierce = AUTO_PISTOL_PIERCE + 1;
+      eff.homing = false;
+      eff.forceCrit = true;
+    }
+  ),
+  behavior: noopBehavior,
+};
+
+// 2) Hollow Field — Aura + Max HP. 50% larger radius, ticks twice as fast.
+const HOLLOW_FIELD_BASE_DAMAGE = AURA_BASE_DAMAGE * 2;
+const HOLLOW_FIELD_BASE_COOLDOWN_MS = Math.round(AURA_BASE_COOLDOWN_MS / 2);
+const HOLLOW_FIELD_BASE_RADIUS = Math.round(AURA_BASE_RADIUS * 1.5);
+const HOLLOW_FIELD_TINT = 0xc488ff; // violet
+
+const hollowField: WeaponDefinition = {
+  id: 'hollow-field',
+  name: 'Hollow Field',
+  description: 'Evolved Aura. Larger radius, double tick rate.',
+  archetype: 'aura',
+  baseDamage: HOLLOW_FIELD_BASE_DAMAGE,
+  baseCooldownMs: HOLLOW_FIELD_BASE_COOLDOWN_MS,
+  tint: HOLLOW_FIELD_TINT,
+  levels: buildLevels(HOLLOW_FIELD_BASE_DAMAGE, HOLLOW_FIELD_BASE_COOLDOWN_MS, 'aura', (lv, eff) => {
+    eff.radius = HOLLOW_FIELD_BASE_RADIUS + (lv - 1) * 20;
+    eff.tickRateMs = eff.cooldownMs;
+    eff.pierce = -1;
+  }),
+  behavior: noopBehavior,
+};
+
+// 3) Reaper's Edge — Blade + Knockback. Bigger radius, executes enemies
+//    below 15% HP after the strike.
+const REAPERS_EDGE_BASE_DAMAGE = BLADE_BASE_DAMAGE * 2;
+const REAPERS_EDGE_BASE_COOLDOWN_MS = BLADE_BASE_COOLDOWN_MS;
+const REAPERS_EDGE_BASE_RADIUS = BLADE_BASE_RADIUS + 40;
+const REAPERS_EDGE_EXEC_FRAC = 0.15;
+const REAPERS_EDGE_TINT = 0xa8253a; // crimson
+
+const reapersEdge: WeaponDefinition = {
+  id: 'reapers-edge',
+  name: "Reaper's Edge",
+  description: 'Evolved Blade. Strikes execute enemies below 15% HP.',
+  archetype: 'melee',
+  baseDamage: REAPERS_EDGE_BASE_DAMAGE,
+  baseCooldownMs: REAPERS_EDGE_BASE_COOLDOWN_MS,
+  tint: REAPERS_EDGE_TINT,
+  restrictedToCharacter: 'brawler',
+  levels: buildLevels(REAPERS_EDGE_BASE_DAMAGE, REAPERS_EDGE_BASE_COOLDOWN_MS, 'melee', (lv, eff) => {
+    eff.radius = REAPERS_EDGE_BASE_RADIUS + (lv - 1) * 10;
+    eff.tickRateMs = eff.cooldownMs;
+    eff.pierce = -1;
+    eff.execBelowFrac = REAPERS_EDGE_EXEC_FRAC;
+  }),
+  behavior: noopBehavior,
+};
+
+// 4) Carpet Bomb — Mortar + Splash. Primary shell detonates, then spawns
+//    4 sub-mortar explosions in a tight ring around the impact site.
+const CARPET_BOMB_BASE_DAMAGE = MORTAR_BASE_DAMAGE * 2;
+const CARPET_BOMB_BASE_COOLDOWN_MS = MORTAR_BASE_COOLDOWN_MS;
+const CARPET_BOMB_SUB_COUNT = 4;
+const CARPET_BOMB_TINT = 0xff5a25; // hot orange
+
+const carpetBomb: WeaponDefinition = {
+  id: 'carpet-bomb',
+  name: 'Carpet Bomb',
+  description: 'Evolved Mortar. Each shell scatters into four sub-detonations.',
+  archetype: 'mortar',
+  baseDamage: CARPET_BOMB_BASE_DAMAGE,
+  baseCooldownMs: CARPET_BOMB_BASE_COOLDOWN_MS,
+  tint: CARPET_BOMB_TINT,
+  hitboxRadius: MORTAR_HITBOX_RADIUS,
+  levels: buildLevels(CARPET_BOMB_BASE_DAMAGE, CARPET_BOMB_BASE_COOLDOWN_MS, 'mortar', (_lv, eff) => {
+    eff.projectileSpeed = MORTAR_PROJECTILE_SPEED;
+    eff.projectileCount = 1;
+    eff.pierce = 0;
+    eff.radius = MORTAR_EXPLOSION_RADIUS;
+    eff.subMortarCount = CARPET_BOMB_SUB_COUNT;
+  }),
+  behavior: noopBehavior,
+};
+
+// 5) Eternal Return — Boomerang + Attack Speed. Ricochets off the four
+//    arena edges up to 3 times before recycling.
+const ETERNAL_RETURN_BASE_DAMAGE = BOOMERANG_BASE_DAMAGE * 2;
+const ETERNAL_RETURN_BASE_COOLDOWN_MS = Math.round(BOOMERANG_BASE_COOLDOWN_MS * 0.8);
+const ETERNAL_RETURN_PROJECTILE_LIFETIME_MS = BOOMERANG_PROJECTILE_LIFETIME_MS + 600;
+const ETERNAL_RETURN_TINT = 0xfff066;
+
+const eternalReturn: WeaponDefinition = {
+  id: 'eternal-return',
+  name: 'Eternal Return',
+  description: 'Evolved Boomerang. Ricochets off arena edges before returning.',
+  archetype: 'boomerang',
+  baseDamage: ETERNAL_RETURN_BASE_DAMAGE,
+  baseCooldownMs: ETERNAL_RETURN_BASE_COOLDOWN_MS,
+  tint: ETERNAL_RETURN_TINT,
+  hitboxRadius: BOOMERANG_HITBOX_RADIUS + 2,
+  levels: buildLevels(ETERNAL_RETURN_BASE_DAMAGE, ETERNAL_RETURN_BASE_COOLDOWN_MS, 'boomerang', (lv, eff) => {
+    eff.projectileSpeed = BOOMERANG_PROJECTILE_SPEED;
+    eff.projectileCount = 1;
+    eff.pierce = BOOMERANG_PIERCE + 2 + (lv - 1);
+    eff.homing = false;
+    eff.ricochetCount = 3;
+  }),
+  behavior: noopBehavior,
+};
+
 export const WEAPONS: Record<string, WeaponDefinition> = {
   [autoPistol.id]: autoPistol,
   [aura.id]: aura,
@@ -510,6 +693,14 @@ export const WEAPONS: Record<string, WeaponDefinition> = {
   [tome.id]: tome,
   [longshot.id]: longshot,
   [hollowCurse.id]: hollowCurse,
+  // Evolutions — surfaced via runStore.generateOffers when the base weapon is
+  // at max level AND its paired augment is owned. Restricted-to-character is
+  // inherited from the base where applicable so the picker filter still works.
+  [phantomShot.id]: phantomShot,
+  [hollowField.id]: hollowField,
+  [reapersEdge.id]: reapersEdge,
+  [carpetBomb.id]: carpetBomb,
+  [eternalReturn.id]: eternalReturn,
 };
 
 // Slow side-channel — frost_nova writes; flowfield reads. Indexed by enemy eid.
@@ -582,6 +773,11 @@ export const PROJECTILE_LIFETIME_MS_BY_WEAPON: Record<string, number> = {
   'boomerang': BOOMERANG_PROJECTILE_LIFETIME_MS,
   'mortar': MORTAR_PROJECTILE_LIFETIME_MS,
   'shotgun': SHOTGUN_PROJECTILE_LIFETIME_MS,
+  // evolutions — inherit the same projectile lifetimes as their base where
+  // it matters (autoAttack falls back to DEFAULT_PROJECTILE_LIFETIME_MS otherwise).
+  'phantom-shot': PHANTOM_SHOT_PROJECTILE_LIFETIME_MS,
+  'carpet-bomb': MORTAR_PROJECTILE_LIFETIME_MS,
+  'eternal-return': ETERNAL_RETURN_PROJECTILE_LIFETIME_MS,
 };
 
 /** Sawblade orbiter angular speed (rad/s). Used by projectile.ts orbit update. */

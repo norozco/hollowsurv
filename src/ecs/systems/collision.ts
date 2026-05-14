@@ -15,8 +15,11 @@
 //   and resilient to system reordering.
 
 import { addComponent, defineQuery, hasComponent } from 'bitecs';
+import type Phaser from 'phaser';
 
 import { eventBus } from '../../core/eventBus';
+import { getArenaScene } from '../../core/gameContext';
+import { rng } from '../../core/rng';
 import { scratchIdBuffer, growIdBuffer } from '../../core/scratch';
 import { SpatialHash } from '../../core/spatialHash';
 import {
@@ -32,7 +35,9 @@ import {
   Projectile,
 } from '../components';
 import { useRunStore } from '../../stores/runStore';
-import { detonateMortar, isMortar } from './autoAttack';
+import { detonateMortar, isForceCritProjectile, isMortar } from './autoAttack';
+import { spawnDamageNumber, spawnDeathPuff } from './damageNumbers';
+import { flashEnemyVisual, getEnemyTint } from './spawnDirector';
 import type { World } from '../world';
 
 // --- shared spatial hash ----------------------------------------------------
@@ -44,12 +49,36 @@ const ENEMY_HASH_CELL_PX = 128;
 
 const enemyHash = new SpatialHash(ENEMY_HASH_CELL_PX);
 
+// --- rebuild tick guard ---------------------------------------------------
+// Avoid rebuilding the hash twice in the same tick. collisionSystem bumps
+// `_hashTickId` once at the top of its tick, then calls rebuildEnemyHash.
+// Anyone else who also reaches for `rebuildEnemyHash` later in the same tick
+// (notably `triggerHollowfieldPulse` from autoAttack on player_hit events)
+// will short-circuit. If a caller knows the hash is genuinely stale —
+// because something moved or died between the rebuild and now — they can
+// call `markEnemyHashStale()` to force the next `rebuildEnemyHash` to run.
+let _hashTickId = 0;
+let _lastHashTickId = -1;
+
+/**
+ * Mark the enemy spatial hash as stale, forcing the next `rebuildEnemyHash`
+ * call to re-populate even if a rebuild has already happened this tick.
+ * Cheap: just resets the per-tick guard.
+ */
+export function markEnemyHashStale(): void {
+  _lastHashTickId = -1;
+}
+
 /**
  * (Re)populate the enemy spatial hash from the current world state. Idempotent
  * within a single tick — calling twice produces the same result as long as no
- * enemy has moved or been added/removed between calls.
+ * enemy has moved or been added/removed between calls. The second call within
+ * a single tick is a no-op (see tick guard above) unless `markEnemyHashStale`
+ * has been called since the last rebuild.
  */
 export function rebuildEnemyHash(world: World): void {
+  if (_lastHashTickId === _hashTickId) return;
+  _lastHashTickId = _hashTickId;
   enemyHash.clear();
   const enemies = enemyQuery(world);
   for (let i = 0; i < enemies.length; i++) {
@@ -92,6 +121,10 @@ export function resetPlayerInvuln(): void {
 
 export function collisionSystem(world: World, _dtMs: number): void {
   if (useRunStore.getState().phase !== 'playing') return;
+
+  // Start of a new tick: bump the hash tick id so the first rebuild this
+  // tick runs and any subsequent same-tick rebuild calls are short-circuited.
+  _hashTickId += 1;
 
   // Defensive rebuild: cheap and ensures correctness regardless of who else
   // populated the hash this tick.
@@ -137,12 +170,22 @@ export function collisionSystem(world: World, _dtMs: number): void {
       }
 
       // Crit + splash + berserker come from runStore (player-side augments).
-      const playerStats = useRunStore.getState().player;
+      const storeSnap = useRunStore.getState();
+      const playerStats = storeSnap.player;
       const lowHp = playerStats.maxHp > 0 && playerStats.hp / playerStats.maxHp <= 0.3;
       const berserkerMul = lowHp ? 1 + playerStats.berserkerMul : 1;
-      const isCrit = playerStats.critChance > 0 && Math.random() < playerStats.critChance;
-      const finalDmg = (isCrit ? dmg * 2 : dmg) * berserkerMul;
-      applyDamageToEnemy(world, eid, finalDmg, ownerEid);
+      // Use rng() for deterministic crit rolls under Daily Seed mode.
+      // Evolved-weapon force-crit (Phantom Shot) bypasses the roll entirely:
+      // every projectile from a forceCrit weapon is treated as a crit.
+      const isCrit = isForceCritProjectile(peid)
+        ? true
+        : playerStats.critChance > 0 && rng() < playerStats.critChance;
+      // Devil's Bargain: bargainBoosts.damageMul is the player-outgoing
+      // multiplier applied on top of Stats.damageMul (already baked into `dmg`
+      // by autoAttack) plus crit and berserker. Identity (1) means no change.
+      const bargainDamageMul = storeSnap.bargainBoosts.damageMul;
+      const finalDmg = (isCrit ? dmg * 2 : dmg) * berserkerMul * bargainDamageMul;
+      applyDamageToEnemy(world, eid, finalDmg, ownerEid, isCrit);
 
       // Splash: deal 30% damage to other enemies near the impact.
       if (playerStats.splashRadius > 0) {
@@ -184,6 +227,13 @@ export function collisionSystem(world: World, _dtMs: number): void {
     const nowMs = performance.now();
     const invulnUntil = playerInvulnUntilMs.get(pe) ?? 0;
     if (nowMs < invulnUntil) continue;
+    // Devil's Bargain: bargainBoosts.invulnUntilMs is a per-bargain
+    // invulnerability window (Cleansing Flame's 5s shield, Second Wind's
+    // 1.5s revive grace). Skipping the rest of the player damage pass means
+    // we don't even start the post-hit invuln window. Identity (0) means
+    // un-bargained runs are unaffected.
+    const bargainInvulnUntil = useRunStore.getState().bargainBoosts.invulnUntilMs;
+    if (nowMs < bargainInvulnUntil) continue;
 
     const px = Position.x[pe] ?? 0;
     const py = Position.y[pe] ?? 0;
@@ -299,29 +349,44 @@ function separateEnemies(world: World): void {
  * to zero, and emits `damage_dealt` / `enemy_killed`.
  *
  * The killer is ownerEid (typically the player) so on_kill hooks can credit.
+ * Visual side-effects (damage number, hit flash, death puff) are fired here
+ * so every damage source — projectiles, splash, aura, thorns — gets identical
+ * game-feel without duplicating the wiring at each call site.
  */
 function applyDamageToEnemy(
   world: World,
   enemyEid: number,
   amount: number,
-  killerEid: number
+  killerEid: number,
+  isCrit: boolean = false,
 ): void {
   const curHp = Health.hp[enemyEid] ?? 0;
   const nextHp = curHp - amount;
   Health.hp[enemyEid] = nextHp;
+
+  // Capture pre-death position for the damage number / death puff. Read once
+  // since the entity may be marked Dead below.
+  const ex = Position.x[enemyEid] ?? 0;
+  const ey = Position.y[enemyEid] ?? 0;
 
   eventBus.emit({
     type: 'damage_dealt',
     target: enemyEid,
     source: killerEid,
     amount,
-    isCrit: false,
+    isCrit,
   });
+
+  // Floating damage number — small numerical feedback above the hit.
+  spawnDamageNumber(ex, ey - 16, amount, isCrit);
+
+  // Hit flash — brief white tint on the enemy rectangle.
+  flashEnemyVisual(enemyEid);
 
   if (nextHp <= 0) {
     markDead(world, enemyEid);
-    const ex = Position.x[enemyEid] ?? 0;
-    const ey = Position.y[enemyEid] ?? 0;
+    // Death puff — small ash burst at the dying enemy's position.
+    spawnDeathPuff(ex, ey, getEnemyTint(enemyEid));
     eventBus.emit({
       type: 'enemy_killed',
       enemy: enemyEid,
@@ -349,6 +414,13 @@ function applyDamageToEnemy(
  *
  * If the player drops to 0 hp we emit `run_lost` so runStore transitions
  * out of `playing` and the run summary modal can show.
+ *
+ * Devil's Bargain hooks:
+ *   - `damageTakenMul` scales incoming damage on top of Steel Skin
+ *     (combined: amount * damageTakenMul * (1 - damageReduction)).
+ *   - `reviveTokens` rescues the player on lethal damage: full heal, 1.5s
+ *     grace invuln, do NOT emit `run_lost`. Brief tween flash on the player
+ *     visual signals the revive without needing a new event.
  */
 function applyDamageToPlayer(
   _world: World,
@@ -356,9 +428,12 @@ function applyDamageToPlayer(
   amount: number,
   sourceEid: number
 ): void {
-  // Steel Skin: scale incoming damage by (1 - reduction).
-  const reduction = useRunStore.getState().player.damageReduction;
-  const scaled = amount * (1 - reduction);
+  const store = useRunStore.getState();
+  // Steel Skin (player.damageReduction) + Devil's Bargain (damageTakenMul)
+  // stack: damageTakenMul scales the raw amount BEFORE Steel Skin applies.
+  const reduction = store.player.damageReduction;
+  const damageTakenMul = store.bargainBoosts.damageTakenMul;
+  const scaled = amount * damageTakenMul * (1 - reduction);
   const curHp = Health.hp[playerEid] ?? 0;
   const nextHp = Math.max(0, curHp - scaled);
   Health.hp[playerEid] = nextHp;
@@ -372,7 +447,28 @@ function applyDamageToPlayer(
   });
 
   if (nextHp <= 0) {
-    const store = useRunStore.getState();
+    // Devil's Bargain: Second Wind — consume a revive token instead of dying.
+    // Full-heal, set a 1.5s grace invuln (via bargainBoosts.invulnUntilMs so
+    // it stacks with the post-hit invuln map check), and skip run_lost.
+    if (store.bargainBoosts.reviveTokens > 0) {
+      const maxHp = Health.maxHp[playerEid] ?? store.player.maxHp;
+      Health.hp[playerEid] = maxHp;
+      const reviveInvulnUntil = performance.now() + 1500;
+      useRunStore.setState((s) => ({
+        bargainBoosts: {
+          ...s.bargainBoosts,
+          reviveTokens: s.bargainBoosts.reviveTokens - 1,
+          invulnUntilMs: Math.max(s.bargainBoosts.invulnUntilMs, reviveInvulnUntil),
+        },
+        player: {
+          ...s.player,
+          hp: maxHp,
+        },
+      }));
+      // Visual: brief player flash so the revive is legible without a new event.
+      flashPlayerVisual();
+      return;
+    }
     eventBus.emit({
       type: 'run_lost',
       timeMs: store.elapsedMs,
@@ -380,6 +476,32 @@ function applyDamageToPlayer(
       kills: store.kills,
     });
   }
+}
+
+/**
+ * Brief tween flash on the Phaser player rectangle. Used as the revive
+ * indicator when a Devil's Bargain reviveToken is consumed. Cheap: pulses
+ * alpha three times via a yoyo'd tween. No-op if the scene isn't active
+ * (we never crash because of the revive visual being unavailable).
+ */
+function flashPlayerVisual(): void {
+  const scene = getArenaScene();
+  if (!scene) return;
+  // The player sprite is the rectangle at depth 100 — we identify it via the
+  // ArenaScene's children list rather than threading a getter, to keep the
+  // collision module independent of the scene API surface.
+  const sceneWithProp = scene as Phaser.Scene & {
+    playerSprite?: Phaser.GameObjects.Rectangle | null;
+  };
+  const sprite = sceneWithProp.playerSprite ?? null;
+  if (!sprite) return;
+  scene.tweens.add({
+    targets: sprite,
+    alpha: { from: 0.2, to: 1 },
+    duration: 200,
+    yoyo: true,
+    repeat: 2,
+  });
 }
 
 /** Add the Dead tag if not present. lifetimeSystem recycles at end of tick. */

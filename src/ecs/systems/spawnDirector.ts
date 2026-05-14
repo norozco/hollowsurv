@@ -19,19 +19,19 @@
 //   - At BOSS_SPAWN_MS the director spawns the boss and *suppresses* further grunt waves
 //     until the boss dies. We detect "boss alive" by querying BossTag entities each tick.
 //
-// Debug rendering (throwaway):
-//   - The director maintains a Map<eid, Phaser.GameObjects.Rectangle> as a placeholder
-//     visualisation. A real render system replaces this once SpriteGPULayer lands.
-//   - The director discovers the active Phaser scene via either a `bindSpawnDirectorScene`
-//     call (preferred — see TODO) or a fallback lookup against the global `__game` handle
-//     exposed by main.tsx. If neither is available, sprite creation is skipped silently
-//     and the simulation still runs (verifiable via runStore.kills counters etc.).
+// Visual rendering is owned by `batchedRender.ts`. The spawn director no longer
+// creates per-entity Phaser GameObjects — it writes Sprite.tint / scale into
+// the ECS components and exposes a small set of side-channels (flash flag,
+// archetype id, base tint cache) that the batched renderer reads. The scene
+// lookup helper is retained because we still need to schedule the timed flash
+// reset (delayedCall) — but no GameObjects are created here.
 
-import Phaser from 'phaser';
+import type Phaser from 'phaser';
 import { addComponent, defineQuery, hasComponent, removeComponent } from 'bitecs';
 
 import { eventBus } from '../../core/eventBus';
 import { ARENA_SIZE_PX } from '../../core/flowfield';
+import { getArenaScene } from '../../core/gameContext';
 import {
   PoolKind,
   acquireEntity,
@@ -70,15 +70,32 @@ const playerLookupQuery = defineQuery([PlayerTag, Position]);
 
 /** Indices of waves already fired this run. */
 const firedWaves = new Set<number>();
-/** Map of enemy/boss eid -> placeholder visual. Throwaway debug rendering. */
-const visuals = new Map<number, Phaser.GameObjects.Rectangle>();
+/** Cache of each spawned enemy's base tint so the hit-flash effect can restore
+ *  it after the brief white blip. Cleared when the entity is recycled (mostly —
+ *  see recycleEnemy comments for the killed-by-name retention exception). */
+const enemyTintCache = new Map<number, number>();
+/** Set of enemy eids currently mid-flash. The batched renderer reads this to
+ *  draw the enemy white instead of its base tint. `flashEnemyVisual` adds an
+ *  eid here; a delayedCall removes it after HIT_FLASH_DURATION_MS. */
+const flashingEnemies = new Set<number>();
+/**
+ * eid -> enemy archetype id (e.g. 'grunt', 'brute', 'boss-prime'). Filled by
+ * spawnEnemyEntity() and consumed by `getEnemyNameForEid()` so the Run Summary
+ * can show "Killed by: brute" without re-querying ECS components.
+ *
+ * Also exposed via globalThis.__getEnemyNameForEid so runStore's damage_dealt
+ * handler can resolve the killer eid without importing this module (which
+ * would otherwise be a circular dependency — spawnDirector already imports
+ * runStore for elapsedMs).
+ */
+const enemyNamesByEid = new Map<number, string>();
 
 /** Optional explicit scene binding. If set, used directly. */
 let boundScene: Phaser.Scene | null = null;
 /** Tracks last attempt at fallback scene lookup so we don't spam on every tick. */
 let triedFallbackLookup = false;
 /**
- * Last-seen runStore.runStartedAtMs. Used to auto-reset wave gating + visuals
+ * Last-seen runStore.runStartedAtMs. Used to auto-reset wave gating + side-channels
  * when a new run begins (menu -> playing -> menu -> playing). The scene module
  * doesn't currently call resetSpawnDirector(), so this is the safety net.
  */
@@ -87,32 +104,49 @@ let lastRunStartedAtMs = 0;
 /**
  * Optional explicit hook for the scene to register itself. Not currently called
  * from ArenaScene (Agent C2 owns the spawn director but cannot edit scene code);
- * the fallback lookup via `globalThis.__game` covers vertical-slice needs.
+ * the fallback lookup via the `gameContext` singleton covers vertical-slice needs.
  */
 export function bindSpawnDirectorScene(scene: Phaser.Scene): void {
   boundScene = scene;
   triedFallbackLookup = false;
 }
 
-/** Reset on shutdown. Wave gating, visuals, scene reference. */
+/** Reset on shutdown. Wave gating, side-channels, scene reference. */
 export function resetSpawnDirector(): void {
   firedWaves.clear();
-  for (const r of visuals.values()) r.destroy();
-  visuals.clear();
+  enemyTintCache.clear();
+  flashingEnemies.clear();
+  enemyNamesByEid.clear();
   boundScene = null;
   triedFallbackLookup = false;
   lastRunStartedAtMs = 0;
 }
 
 /**
- * Lighter reset that only clears per-run state (wave gating + visuals) and
- * keeps the scene binding. Called automatically when a new run starts.
+ * Lighter reset that only clears per-run state (wave gating + side-channels)
+ * and keeps the scene binding. Called automatically when a new run starts.
  */
 function resetForNewRun(): void {
   firedWaves.clear();
-  for (const r of visuals.values()) r.destroy();
-  visuals.clear();
+  enemyTintCache.clear();
+  flashingEnemies.clear();
+  enemyNamesByEid.clear();
 }
+
+/**
+ * Look up the archetype id for a previously-spawned enemy. Returns undefined
+ * when the eid is unknown (already recycled, never spawned by this director,
+ * or just out of range). Stable for the lifetime of the entity — the map is
+ * populated at spawn and cleared at recycle.
+ */
+export function getEnemyNameForEid(eid: number): string | undefined {
+  return enemyNamesByEid.get(eid);
+}
+
+// Expose for runStore's damage_dealt handler without a circular import. Set
+// once at module load; safe because Map references are stable.
+(globalThis as { __getEnemyNameForEid?: (eid: number) => string | undefined })
+  .__getEnemyNameForEid = getEnemyNameForEid;
 
 // --- helpers -----------------------------------------------------------------
 
@@ -121,10 +155,8 @@ function getActiveScene(): Phaser.Scene | null {
   if (triedFallbackLookup) return null;
   triedFallbackLookup = true;
 
-  // Fallback: discover via the global handle that main.tsx exposes.
-  const game = (globalThis as { __game?: Phaser.Game }).__game;
-  if (!game) return null;
-  const arena = game.scene.getScene('ArenaScene');
+  // Fallback: resolve via the typed gameContext singleton.
+  const arena = getArenaScene();
   if (!arena) return null;
   boundScene = arena;
   return arena;
@@ -205,7 +237,7 @@ const _playerPosScratch = { x: 0, y: 0 };
  */
 function spawnEnemyEntity(
   world: World,
-  scene: Phaser.Scene | null,
+  _scene: Phaser.Scene | null,
   def: EnemyDefinition,
   x: number,
   y: number,
@@ -251,24 +283,30 @@ function spawnEnemyEntity(
   // Defensive: pool reuse may leave a Dead tag on a recycled eid. Strip it.
   if (hasComponent(world, Dead, eid)) removeComponent(world, Dead, eid);
 
-  // Throwaway debug rendering.
-  if (scene) {
-    const sizePx = def.hitboxRadius * 2;
-    const rect = scene.add.rectangle(x, y, sizePx, sizePx, def.tint);
-    if (def.isBoss) rect.setStrokeStyle(2, 0xffffff);
-    visuals.set(eid, rect);
-  }
+  // Defensive: pool reuse may leave a stale flash flag on a recycled eid.
+  // Strip it so a freshly-spawned enemy isn't drawn white for a frame.
+  flashingEnemies.delete(eid);
+
+  // Cache the base tint so flashEnemyVisual() can restore after the white blip.
+  // Also consumed by the batched renderer for the death-puff fallback path.
+  enemyTintCache.set(eid, def.tint);
+  // Cache the archetype id so runStore's death recap can resolve "Killed by: <name>".
+  enemyNamesByEid.set(eid, def.id);
 
   return eid;
 }
 
-/** Recycle an enemy eid: release the entity and remove its visual if any. */
+/** Recycle an enemy eid: release the entity back to the pool. */
 function recycleEnemy(world: World, eid: number): void {
-  const rect = visuals.get(eid);
-  if (rect) {
-    rect.destroy();
-    visuals.delete(eid);
-  }
+  enemyTintCache.delete(eid);
+  flashingEnemies.delete(eid);
+  // Note: we INTENTIONALLY do NOT delete from enemyNamesByEid here. When an
+  // enemy is recycled because it killed the player, the runStore needs to
+  // resolve the killer name *after* recycle (the damage_dealt event fires
+  // before the entity's lifecycle ends, but we want the name to survive long
+  // enough for the Run Summary to read it). The map is cleared per-run by
+  // resetForNewRun(); within a run the map can grow up to the pool cap, which
+  // is bounded and trivially small in memory terms.
   releaseEntity(world, eid);
 }
 
@@ -303,9 +341,20 @@ function fireWave(world: World, scene: Phaser.Scene | null, wave: WaveDef): void
   const cap = isBoss ? poolCapacity(PoolKind.Boss) : poolCapacity(PoolKind.Enemy);
   let active = isBoss ? poolActiveCount(PoolKind.Boss) : poolActiveCount(PoolKind.Enemy);
 
-  for (let i = 0; i < wave.count; i++) {
+  // Devil's Bargain: spawnRateMul scales grunt-wave size while the boost
+  // window is active. Boss waves ignore the multiplier (count is always 1).
+  // The mul is capped implicitly by `active >= cap` in the spawn loop.
+  let effectiveCount = wave.count;
+  if (!isBoss) {
+    const boosts = useRunStore.getState().bargainBoosts;
+    if (boosts.spawnRateMul !== 1 && performance.now() < boosts.spawnRateUntilMs) {
+      effectiveCount = Math.max(1, Math.floor(wave.count * boosts.spawnRateMul));
+    }
+  }
+
+  for (let i = 0; i < effectiveCount; i++) {
     if (active >= cap) break;
-    offsetForFormation(wave.formation, i, wave.count, radius, formationSeed, _offsetScratch);
+    offsetForFormation(wave.formation, i, effectiveCount, radius, formationSeed, _offsetScratch);
     const x = _playerPosScratch.x + _offsetScratch.dx;
     const y = _playerPosScratch.y + _offsetScratch.dy;
     const eid = spawnEnemyEntity(world, scene, def, x, y);
@@ -315,24 +364,6 @@ function fireWave(world: World, scene: Phaser.Scene | null, wave: WaveDef): void
       eventBus.emit({ type: 'boss_spawned', boss: eid });
     }
   }
-}
-
-/** Garbage-collect visuals whose ECS entity has been despawned/recycled. */
-function syncVisuals(world: World): void {
-  if (visuals.size === 0) return;
-  const dead: number[] = [];
-  for (const [eid, rect] of visuals) {
-    const alive =
-      hasComponent(world, EnemyTag, eid) || hasComponent(world, BossTag, eid);
-    if (!alive) {
-      rect.destroy();
-      dead.push(eid);
-      continue;
-    }
-    rect.x = Position.x[eid] ?? rect.x;
-    rect.y = Position.y[eid] ?? rect.y;
-  }
-  for (const eid of dead) visuals.delete(eid);
 }
 
 /** Are any boss-tagged entities alive? */
@@ -352,7 +383,8 @@ function isBossAlive(world: World): boolean {
  * Tick the spawn director. Called once per frame after movementSystem (per the
  * tick order in CONTRACTS.md §6).
  *
- * No allocations except for the visuals map (one-time per spawn / despawn).
+ * No allocations on the steady path (firedWaves grows once per wave; recycle
+ * frees pool entries without touching the heap).
  */
 export function spawnDirectorSystem(world: World, _dtMs: number): void {
   if (useRunStore.getState().phase !== 'playing') return;
@@ -396,14 +428,23 @@ export function spawnDirectorSystem(world: World, _dtMs: number): void {
   // Detect "boss is currently alive" once per tick — used to gate post-10:00 grunt waves.
   const bossAlive = isBossAlive(world);
 
+  // Devil's Bargain: bossSpawnOffsetMs shifts the boss-wave trigger time.
+  // Negative shifts boss earlier; positive shifts it later. Boss waves can
+  // therefore fire out-of-order with respect to WAVES' index ordering, so we
+  // can't use a single `break` on `elapsed < wave.atMs` — we evaluate every
+  // wave each tick. The set-membership `firedWaves.has(i)` guard makes the
+  // skip cost trivial.
+  const bossOffsetMs = useRunStore.getState().bargainBoosts.bossSpawnOffsetMs;
+
   // Fire any waves whose time has come. Keep the index stable (don't sort WAVES).
   for (let i = 0; i < WAVES.length; i++) {
     if (firedWaves.has(i)) continue;
     const wave = WAVES[i];
     if (!wave) continue;
-    if (elapsed < wave.atMs) break; // WAVES is time-sorted; no point checking later.
 
     const isBossWave = wave.isBoss === true;
+    const triggerMs = isBossWave ? wave.atMs + bossOffsetMs : wave.atMs;
+    if (elapsed < triggerMs) continue;
 
     // Boss-suppression rule: once we've passed BOSS_SPAWN_MS, *non-boss* waves
     // only fire when the boss is dead. Boss waves themselves always fire.
@@ -421,8 +462,7 @@ export function spawnDirectorSystem(world: World, _dtMs: number): void {
 
   // Sweep any enemies whose Dead tag landed this tick. The lifetimeSystem (Agent C3)
   // is the canonical recycler, but until that's implemented we handle Dead enemies
-  // ourselves to keep visuals in sync. Once C3 lands lifetimeSystem, this loop
-  // becomes a no-op (no entity will reach the spawn director with a Dead tag).
+  // ourselves to release them back to their pools.
   const enemies = enemyQuery(world);
   for (let i = 0; i < enemies.length; i++) {
     const eid = enemies[i];
@@ -435,8 +475,6 @@ export function spawnDirectorSystem(world: World, _dtMs: number): void {
     if (eid === undefined) continue;
     if (hasComponent(world, Dead, eid)) recycleEnemy(world, eid);
   }
-
-  syncVisuals(world);
 }
 
 // --- public spawn helpers (Hollow mechanics) ---------------------------------
@@ -464,17 +502,64 @@ export function spawnEnemyAt(world: World, enemyId: string, x: number, y: number
 /**
  * Override the visual tint of a previously-spawned enemy. Useful for Bone
  * Hollow bonespawns (we recolor a `skirmisher` to white). Writes the Sprite
- * component AND the placeholder rectangle.
+ * component and updates the flash-restore cache so the batched renderer reads
+ * the new tint next frame.
  */
 export function tintSpawnedEnemy(eid: number, tint: number): void {
   Sprite.tint[eid] = tint;
-  const rect = visuals.get(eid);
-  if (rect) rect.fillColor = tint;
+  // Keep the flash-restore cache in sync so a hit-flashed Bone skeleton
+  // returns to its white tint rather than the original grey skirmisher color.
+  enemyTintCache.set(eid, tint);
 }
 
-/** Scale the placeholder visual of a spawned enemy (multiplier; 1 = native). */
+/**
+ * Scale the rendered size of a spawned enemy (multiplier; 1 = native). The
+ * batched renderer reads `Sprite.scale[eid]` each tick.
+ */
 export function scaleSpawnedEnemy(eid: number, scale: number): void {
   Sprite.scale[eid] = scale;
-  const rect = visuals.get(eid);
-  if (rect) rect.setScale(scale);
+}
+
+/** How long an enemy stays tinted white after a hit (ms). */
+const HIT_FLASH_DURATION_MS = 80;
+
+/**
+ * Mark an enemy as "flashing" for HIT_FLASH_DURATION_MS so the batched
+ * renderer draws it white instead of its base tint. Idempotent within the
+ * flash window: if a second hit lands mid-flash, the existing timer still
+ * fires correctly and no new delayedCall is scheduled.
+ *
+ * No-op if we can't find the scene to schedule the restore — in that case the
+ * flag would stick on forever. We rely on the spawn director's scene binding
+ * being live by the time projectiles can hit (collision runs after
+ * autoAttack and the scene is bound in ArenaScene.create).
+ */
+export function flashEnemyVisual(eid: number): void {
+  if (flashingEnemies.has(eid)) return;
+  const scene = getActiveScene();
+  if (!scene) return;
+  flashingEnemies.add(eid);
+  scene.time.delayedCall(HIT_FLASH_DURATION_MS, () => {
+    flashingEnemies.delete(eid);
+  });
+}
+
+/** True while the enemy is mid-hit-flash. Consumed by `batchedRender`. */
+export function isEnemyFlashing(eid: number): boolean {
+  return flashingEnemies.has(eid);
+}
+
+/** Read the cached base tint for an enemy. Returns 0xffffff if unknown. */
+export function getEnemyTint(eid: number): number {
+  return enemyTintCache.get(eid) ?? 0xffffff;
+}
+
+/**
+ * Read the archetype id (e.g. 'grunt', 'skirmisher', 'brute', 'boss-prime')
+ * for a previously-spawned enemy. Used by the batched renderer to add
+ * archetype-specific visual flourishes without re-querying ECS components.
+ * Returns undefined for unknown eids — caller skips the flourish branch.
+ */
+export function getEnemyArchetypeId(eid: number): string | undefined {
+  return enemyNamesByEid.get(eid);
 }

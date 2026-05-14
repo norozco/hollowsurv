@@ -61,6 +61,14 @@ export function unbindCamera(): void {
  * automatically; we just have to keep the sprite honest.
  *
  * Skipped while the run is not in the 'playing' phase.
+ *
+ * Arena edge handling: camera bounds are set in `bindCamera` via
+ * `cam.setBounds(0, 0, ARENA_SIZE_PX, ARENA_SIZE_PX)`. Phaser clamps the
+ * viewport to those bounds automatically — so as the player approaches the
+ * arena edge the camera stops scrolling and the player visually moves toward
+ * the screen edge. The player's ECS Position is independently clamped to
+ * `[0, ARENA_SIZE_PX]` in movementSystem so the player itself can never
+ * leave the arena. Both clamps are required and present.
  */
 export function cameraSystem(_world: World, _dtMs: number): void {
   if (useRunStore.getState().phase !== 'playing') return;

@@ -22,6 +22,7 @@
 import { useRunStore } from '../../stores/runStore';
 import { BARGAIN_LIST, type BargainDefinition } from '../../content/bargains';
 import { eventBus } from '../../core/eventBus';
+import { rng } from '../../core/rng';
 import type { World } from '../world';
 
 /** Time between successive bargain offers, in ms of run-time. */
@@ -54,7 +55,8 @@ function resetForNewRun(runStartedAtMs: number): void {
 function pickBargain(): BargainDefinition | null {
   const eligible = BARGAIN_LIST.filter((b) => !b.canOffer || b.canOffer());
   if (eligible.length === 0) return null;
-  const idx = Math.floor(Math.random() * eligible.length);
+  // Use rng() so bargain offer order is deterministic under Daily Seed.
+  const idx = Math.floor(rng() * eligible.length);
   return eligible[idx] ?? null;
 }
 

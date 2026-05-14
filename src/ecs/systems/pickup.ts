@@ -29,7 +29,7 @@ import {
 import { useRunStore } from '../../stores/runStore';
 import type { World } from '../world';
 
-import { destroyOrbSprite, PICKUP_KIND_XP } from './xp';
+import { PICKUP_KIND_XP } from './xp';
 
 // --- tunables ---------------------------------------------------------------
 
@@ -159,8 +159,9 @@ function collect(world: World, eid: number): void {
     value,
   });
 
-  // Visual cleanup before component strip (releaseEntity removes Pickup et al.).
-  destroyOrbSprite(eid);
+  // Pickup visuals are batched (`batchedRender.ts`) — once releaseEntity
+  // strips the Pickup component, the renderer's query stops returning this
+  // eid so the orb stops drawing without any explicit destroy call.
 
   // Mark Dead in case any future system (lifetime, audit) wants to observe
   // collection within the same tick. releaseEntity strips this immediately,

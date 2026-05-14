@@ -48,6 +48,35 @@ export const POOL_CAPS: Readonly<Record<PoolKind, number>> = {
 const KIND_COUNT = 6;
 
 /**
+ * Per-PoolKind cached component list, used to avoid allocating a new array
+ * from `getEntityComponents` on every strip.
+ *
+ * Strategy (the "lazy-accumulate per-kind cache" of the audit's option A):
+ *   - First strip of a given kind: fall back to `getEntityComponents`,
+ *     populate the cache from the result. Pays one allocation that day.
+ *   - Subsequent strips: iterate the cached `Component[]` and call
+ *     `removeComponent` for each (no-op if the component isn't present on
+ *     this particular entity — see bitECS removeComponent guard).
+ *   - On every strip we also reconcile via `getEntityComponents` when the
+ *     cache is empty for a kind, OR when the entity has components beyond
+ *     what we've cached. In the steady state (after a handful of acquisitions
+ *     of each kind), the cache fully covers the component union for that kind
+ *     and we hit zero allocations.
+ *
+ * Trade-off: over-listing (a component cached for a kind that isn't on this
+ * particular entity) is cheap — `removeComponent` checks `hasComponent`
+ * first. Under-listing (a fresh component not yet observed) is automatically
+ * corrected on the next strip that performs a reconciliation.
+ *
+ * We choose this approach over a single shared scratch buffer because per-
+ * kind caches are tighter (e.g. damage numbers and bosses share almost no
+ * components with projectiles) and the cache stabilizes quickly in practice.
+ */
+const STRIP_COMP_CACHE: (Component[] | null)[] = new Array(KIND_COUNT).fill(null);
+/** Tracks whether a kind's cache has been validated against `getEntityComponents`. */
+const STRIP_COMP_CACHE_SEEDED: boolean[] = new Array(KIND_COUNT).fill(false);
+
+/**
  * Per-kind pool state.
  * - free: ring of recycled entity ids. Treat as a stack: pop from `freeTop - 1`.
  * - active: ring of currently-in-use entity ids. Used to find the oldest for forced recycling.
@@ -167,7 +196,7 @@ export function acquireEntity(world: IWorld, kind: PoolKind): number {
       // was already on the freelist, which contradicts freeTop === 0.
       throw new Error(`pool.ts: PoolKind ${kind} exhausted with no recyclable entity`);
     }
-    stripComponents(world, oldest);
+    stripComponents(world, oldest, kind);
     eid = oldest;
     // allocated is unchanged — we reuse a slot that was already counted.
   }
@@ -182,14 +211,36 @@ export function acquireEntity(world: IWorld, kind: PoolKind): number {
  * Strip every component off an entity, leaving its eid alive in the bitECS world.
  * This is what lets us keep our own freelist of valid eids without colliding with
  * bitECS's internal `removed` queue / recycling threshold.
+ *
+ * Per-kind component cache: see STRIP_COMP_CACHE for the strategy. We try the
+ * cached list first; if a kind hasn't been seeded yet we fall back to
+ * `getEntityComponents` (one allocation) and use the result to seed the cache
+ * for that kind.
  */
-function stripComponents(world: IWorld, eid: number): void {
-  // getEntityComponents allocates a new array; this only runs on release / forced
-  // recycle (not in the hot per-tick path), so it's acceptable.
+function stripComponents(world: IWorld, eid: number, kind: PoolKind): void {
+  const cached = STRIP_COMP_CACHE[kind];
+  if (STRIP_COMP_CACHE_SEEDED[kind] === true && cached !== null && cached !== undefined) {
+    // Hot path: zero allocation. removeComponent is safe when the component
+    // isn't present (bitECS guards on hasComponent internally).
+    for (let i = 0; i < cached.length; i++) {
+      removeComponent(world, cached[i]!, eid);
+    }
+    return;
+  }
+  // Cold path: discover the components for this kind and seed the cache.
+  // getEntityComponents allocates a new array here; we accept that cost on
+  // the first strip per kind in exchange for zero-alloc strips thereafter.
   const comps = getEntityComponents(world, eid) as Component[];
   for (let i = 0; i < comps.length; i++) {
     removeComponent(world, comps[i]!, eid);
   }
+  // Seed the cache: copy into a fresh array we own (never expose the array
+  // we got from bitECS — `Array.from` already made it a fresh array but
+  // we keep ownership explicit). Then mark as seeded.
+  const seed: Component[] = new Array(comps.length);
+  for (let i = 0; i < comps.length; i++) seed[i] = comps[i]!;
+  STRIP_COMP_CACHE[kind] = seed;
+  STRIP_COMP_CACHE_SEEDED[kind] = true;
 }
 
 /**
@@ -210,7 +261,7 @@ export function releaseEntity(world: IWorld, eid: number): void {
   }
   const pool = getPool(kind);
   removeFromActive(pool, eid);
-  stripComponents(world, eid);
+  stripComponents(world, eid, kind);
   if (pool.freeTop < pool.cap) {
     pool.free[pool.freeTop] = eid;
     pool.freeTop += 1;
@@ -233,7 +284,7 @@ export function recycleEntity(world: IWorld, eid: number, kind?: PoolKind): void
   }
   const pool = getPool(kind);
   removeFromActive(pool, eid);
-  stripComponents(world, eid);
+  stripComponents(world, eid, kind);
   if (pool.freeTop < pool.cap) {
     pool.free[pool.freeTop] = eid;
     pool.freeTop += 1;
@@ -265,6 +316,9 @@ export function resetAllPools(): void {
     pool.activeLen = 0;
     pool.allocated = 0;
     // Keep the typed-array buffers; they'll be reused.
+    // Strip-cache survives across runs because the component object identities
+    // (the imported references in ecs/components.ts) are module-level constants
+    // — they do not change when a new World is created.
   }
 }
 

@@ -38,6 +38,42 @@ let next: ActiveTrack | null = null;
 let fadeTimer: ReturnType<typeof setInterval> | null = null;
 let lastBossAlive = false;
 
+// --- voice ducking ---------------------------------------------------------
+// audio.ts calls duckMusicFor() each time a voice clip plays so the line is
+// audible over the music. We don't drop the volume instantly — that would
+// click. Instead we track a "duck target" alongside the natural volume and
+// the per-tick volume code (in the polling loop) smoothly tweens toward
+// whichever is currently active.
+//
+// Numbers:
+//   - duck depth: 35% of the configured music volume
+//   - attack:    ~200ms ramp down to ducked level
+//   - sustain:   clip duration + 200ms tail
+//   - release:   ~600ms ramp back up
+//
+// Implementation uses per-tick exponential smoothing: el.volume += (target -
+// el.volume) * alpha. Two alphas (attack vs release) approximate the rates.
+const DUCK_LEVEL = 0.35;
+const DUCK_TAIL_MS = 200;
+const TICK_MS = 50; // poll cadence (was 1000ms; 50ms is smooth enough for a 200ms attack)
+// Per-tick blend factors. At 50ms ticks: 1 - exp(-50/τ).
+// τ ≈ 200ms attack  → α ≈ 0.221
+// τ ≈ 600ms release → α ≈ 0.080
+const DUCK_ATTACK_ALPHA = 1 - Math.exp(-TICK_MS / 200);
+const DUCK_RELEASE_ALPHA = 1 - Math.exp(-TICK_MS / 600);
+
+let _duckUntilMs = 0;
+
+/**
+ * Duck the music down to ~35% for `ms` milliseconds (plus a 200ms tail), then
+ * smoothly ramp back up. Called from playVoice() in audio.ts. Multiple calls
+ * stack via max() so a longer clip extends the duck rather than truncating it.
+ */
+export function duckMusicFor(ms: number): void {
+  const safeMs = Number.isFinite(ms) && ms > 0 ? ms : 2000;
+  _duckUntilMs = Math.max(_duckUntilMs, performance.now() + safeMs + DUCK_TAIL_MS);
+}
+
 function createTrack(key: string, targetVolume: number): ActiveTrack {
   const src = TRACKS[key];
   const el = new Audio(src);
@@ -164,13 +200,23 @@ export function subscribeMusic(): void {
     transitionTo(pickTrackForState());
   });
 
-  // Poll musicVolume changes every second so a settings change updates volume
-  // live. (Avoids subscribing to metaStore separately for one field.)
+  // Poll the music volume on a fast tick. This serves two purposes:
+  //   1. Track the metaStore settings.musicVolume slider live (no separate
+  //      subscription needed).
+  //   2. Smoothly attack/release the duck target driven by duckMusicFor().
+  // We only adjust volume on `current` when there's no active crossfade
+  // (`next` is null) — during a crossfade the fade timer owns the volumes.
   pollTimer = setInterval(() => {
-    if (current && !next) {
-      current.el.volume = readVolume();
-    }
-  }, 1000);
+    if (!current || next) return;
+    const base = readVolume();
+    const ducked = performance.now() < _duckUntilMs;
+    const target = ducked ? base * DUCK_LEVEL : base;
+    const alpha = ducked ? DUCK_ATTACK_ALPHA : DUCK_RELEASE_ALPHA;
+    const cur = current.el.volume;
+    // Snap when very close — avoids long floating-point tail.
+    const nextVol = Math.abs(target - cur) < 0.005 ? target : cur + (target - cur) * alpha;
+    current.el.volume = Math.max(0, Math.min(1, nextVol));
+  }, TICK_MS);
 }
 
 /** Stop music entirely (e.g. on app teardown). */

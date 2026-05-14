@@ -4,19 +4,19 @@
 // Owner: Agent C4.
 //
 // Tick role (ARCHITECTURE.md §3):
-//   pickupSystem -> xpSystem. xpSystem does no per-frame work; it consumes an
-//   internal queue populated by the eventBus subscription so that spawning
-//   happens on the simulation tick (consistent with the rest of the pipeline).
+//   pickupSystem -> xpSystem. xpSystem does no per-frame work beyond draining
+//   the pending-drop queue (populated by the eventBus subscription) so that
+//   spawning happens on the simulation tick (consistent with the rest of the
+//   pipeline).
 //
-// Phaser visuals: the orb is rendered by a placeholder Arc GameObject created
-// in `acquireOrbSprite`. We keep a Map<eid, Arc> updated each tick from the
-// ECS Position. When pickupSystem releases the entity, the sprite is destroyed.
-// Once C3/C1 ship a SpriteGPULayer, this throwaway-render code can be deleted.
+// Rendering: handled by the batched renderer (`batchedRender.ts`). xpSystem
+// only writes ECS components — Position + Sprite.tint + Hitbox.radius drive
+// the procedural draw. No per-orb Phaser GameObjects are created.
 import { addComponent } from 'bitecs';
-import Phaser from 'phaser';
 
 import { eventBus } from '../../core/eventBus';
 import { acquirePickup } from '../../core/pool';
+import { rng } from '../../core/rng';
 import {
   Hitbox,
   Pickup,
@@ -47,19 +47,6 @@ const HEAL_TINT = 0xff5577;
 const HEAL_DROP_CHANCE = 0.08; // 8% chance per kill
 const HEAL_VALUE = 20;
 
-/** Visual placeholder radius for the Phaser circle. */
-const ORB_VISUAL_RADIUS_PX = 6;
-const HEAL_VISUAL_RADIUS_PX = 9;
-
-/**
- * Map of pickup eid -> Phaser Arc used as a stand-in sprite. Module-local
- * because there's only ever one ArenaScene at a time (ARCHITECTURE.md §3).
- *
- * Exported so pickupSystem can update positions and destroy on collection
- * without re-importing Phaser internals.
- */
-export const ORB_SPRITES: Map<number, Phaser.GameObjects.Arc> = new Map();
-
 /**
  * Internal queue of (x, y, value) triples to spawn on the next xp tick.
  * Synchronous emit -> tick spawn keeps spawning consistent with the rest of
@@ -89,35 +76,12 @@ function ensureSubscribed(): void {
     const y = e.position?.y ?? 0;
     _pendingDrops.push({ x, y, value: DEFAULT_XP_VALUE, kind: PICKUP_KIND_XP });
     // Roll for a health-pack drop on top of the XP orb.
-    if (Math.random() < HEAL_DROP_CHANCE) {
+    // Use rng() so heal drops are deterministic under Daily Seed.
+    if (rng() < HEAL_DROP_CHANCE) {
       // Offset slightly so the heal pack and XP orb don't perfectly overlap visually.
       _pendingDrops.push({ x: x + 16, y: y + 4, value: HEAL_VALUE, kind: PICKUP_KIND_HEAL });
     }
   });
-}
-
-/**
- * Find the active Phaser ArenaScene if Phaser has booted. Returns null when
- * the scene isn't running (e.g. during boot, between runs). Visual orbs are
- * skipped in that case but the ECS state still updates — safe.
- */
-function findArenaScene(): Phaser.Scene | null {
-  const game = (globalThis as { __game?: Phaser.Game }).__game;
-  if (!game) return null;
-  const scene = game.scene.getScene('ArenaScene');
-  if (!scene) return null;
-  // `getScene` can return a non-running scene; only use it when active so we
-  // don't add GameObjects to a scene that hasn't created its display list.
-  if (!game.scene.isActive('ArenaScene')) return null;
-  return scene;
-}
-
-function acquireOrbSprite(scene: Phaser.Scene, eid: number, x: number, y: number, isHeal: boolean): void {
-  const radius = isHeal ? HEAL_VISUAL_RADIUS_PX : ORB_VISUAL_RADIUS_PX;
-  const tint = isHeal ? HEAL_TINT : PICKUP_TINT;
-  const arc = scene.add.circle(x, y, radius, tint);
-  arc.setStrokeStyle(isHeal ? 2 : 1, 0xffffff, isHeal ? 0.85 : 0.5);
-  ORB_SPRITES.set(eid, arc);
 }
 
 /**
@@ -150,17 +114,11 @@ function spawnPickup(world: World, x: number, y: number, value: number, kind: nu
   Sprite.tint[eid] = tint;
   Sprite.scale[eid] = 1;
   Sprite.rotation[eid] = 0;
-
-  const scene = findArenaScene();
-  if (scene) {
-    acquireOrbSprite(scene, eid, x, y, isHeal);
-  }
 }
 
 /**
  * Tick the XP system. Drains the pending-drop queue (populated by the
- * eventBus subscription) and spawns one orb per drop. Then syncs each orb's
- * Phaser sprite to its ECS Position so movement/magnetism is visible.
+ * eventBus subscription) and spawns one orb per drop.
  *
  * Skipped while the run is not in the 'playing' phase — but the subscription
  * stays live so events queued during pause are still processed once the run
@@ -180,29 +138,6 @@ export function xpSystem(world: World, _dtMs: number): void {
     }
     _pendingDrops.length = 0;
   }
-
-  // --- sync orb sprites to ECS Position ---
-  // The Map is small (bounded by PoolKind.Pickup cap = 1000) and only iterated
-  // when there are active orbs.
-  if (ORB_SPRITES.size > 0) {
-    for (const [eid, arc] of ORB_SPRITES) {
-      arc.x = Position.x[eid] ?? arc.x;
-      arc.y = Position.y[eid] ?? arc.y;
-    }
-  }
-}
-
-/**
- * Destroy the Phaser sprite for a pickup eid. Called by pickupSystem when an
- * orb is collected (and would also be called on forced pool recycle if/when
- * lifetimeSystem grows that hook).
- */
-export function destroyOrbSprite(eid: number): void {
-  const arc = ORB_SPRITES.get(eid);
-  if (arc) {
-    arc.destroy();
-    ORB_SPRITES.delete(eid);
-  }
 }
 
 /**
@@ -215,6 +150,4 @@ export function _resetXpSystemForTest(): void {
     _unsubscribe = null;
   }
   _pendingDrops.length = 0;
-  for (const arc of ORB_SPRITES.values()) arc.destroy();
-  ORB_SPRITES.clear();
 }

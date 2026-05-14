@@ -16,14 +16,15 @@
 //              apply a radial nudge to every enemy toward the arena center,
 //              and flash an expanding ring visual at the center.
 //
-// All Phaser visuals discovered via the same `__game` global the spawn director
-// uses. Module state survives HMR; we hook 'character_selected' (fires on
-// startRun) to wipe per-run state.
+// All Phaser visuals are discovered via the `gameContext` singleton (same as
+// the spawn director). Module state survives HMR; we hook 'character_selected'
+// (fires on startRun) to wipe per-run state.
 
 import { defineQuery, hasComponent } from 'bitecs';
 
 import { eventBus } from '../../core/eventBus';
 import { ARENA_SIZE_PX } from '../../core/flowfield';
+import { getArenaScene } from '../../core/gameContext';
 import { rng } from '../../core/rng';
 import { Dead, EnemyTag, BossTag, PlayerTag, Position } from '../components';
 import type { HollowId } from '../../content/hollows';
@@ -237,11 +238,7 @@ function spawnBonespawn(world: World, x: number, y: number): void {
 // --- Ember Hollow ------------------------------------------------------------
 
 function findScene(): Phaser.Scene | null {
-  const game = (globalThis as { __game?: Phaser.Game }).__game;
-  if (!game) return null;
-  const scene = game.scene.getScene('ArenaScene');
-  if (!scene || !game.scene.isActive('ArenaScene')) return null;
-  return scene;
+  return getArenaScene();
 }
 
 function spawnFirePatch(x: number, y: number): void {

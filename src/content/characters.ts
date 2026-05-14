@@ -13,7 +13,7 @@
 //   - 'ranger', 'brawler' — unlocked from the start.
 //   - 'witch'      — Survive 5:00 as Brawler (won OR lost).
 //   - 'sniper'     — Survive 8:00 as Ranger (won OR lost).
-//   - 'cursed-one' — Beat the boss with any character.
+//   - 'cursed-one' — Survive 6:00 with any character (won OR lost).
 //
 // `unlockCondition` is the player-facing copy shown on locked cards in the
 // character grid. The actual unlock logic lives in metaStore so the unlock can
@@ -100,7 +100,7 @@ export const CHARACTERS: Record<string, CharacterDefinition> = {
       maxHpDelta: -70,
       damageMul: 2.0,
     },
-    unlockCondition: 'Beat the boss with any character',
+    unlockCondition: 'Survive 6:00 with any character',
   },
 };
 

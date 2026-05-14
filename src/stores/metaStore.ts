@@ -19,11 +19,15 @@
 //        v3 -> v4 seeds it with an empty object. Each entry is keyed by
 //        `YYYY-MM-DD` (local date) and holds the best survival ms for that
 //        day's seeded run.
+//   v5 — added `tutorialSeen: boolean` for the first-time onboarding hints.
+//        Defaults to false on a fresh save; the OnboardingHints overlay shows
+//        three contextual prompts during the player's first run and flips this
+//        flag to true on run end so they never appear again.
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 
 const SAVE_KEY = 'hollowsurv.save.v1';
-const SCHEMA_VERSION = 4 as const;
+const SCHEMA_VERSION = 5 as const;
 
 /** Default starter characters — unlocked on a fresh save. */
 const STARTER_CHARACTER_IDS: readonly string[] = ['ranger', 'brawler'];
@@ -56,6 +60,13 @@ export interface MetaState {
    *  Populated only when a daily-mode run completes. */
   dailyBestTimeMs: Record<string, number>;
 
+  /**
+   * Whether the first-time onboarding hints have been shown. False on a fresh
+   * save; flipped to true at the end of the player's first run (any outcome).
+   * Once true, the OnboardingHints overlay renders nothing.
+   */
+  tutorialSeen: boolean;
+
   // actions
   /**
    * Persist a finished run.
@@ -74,6 +85,8 @@ export interface MetaState {
   setMusicVolume: (v: number) => void;
   setSfxVolume: (v: number) => void;
   setScreenShake: (b: boolean) => void;
+  /** Flip the first-time-tutorial flag. Called at end-of-run on the first run. */
+  setTutorialSeen: (b: boolean) => void;
   resetAll: () => void;
 }
 
@@ -88,6 +101,7 @@ type PersistedShape = Pick<
   | 'unlocks'
   | 'unlockedCharacterIds'
   | 'dailyBestTimeMs'
+  | 'tutorialSeen'
 >;
 
 const DEFAULT_PERSISTED: PersistedShape = {
@@ -100,6 +114,7 @@ const DEFAULT_PERSISTED: PersistedShape = {
   unlocks: { weapons: [] },
   unlockedCharacterIds: [...STARTER_CHARACTER_IDS],
   dailyBestTimeMs: {},
+  tutorialSeen: false,
 };
 
 /**
@@ -109,7 +124,11 @@ const DEFAULT_PERSISTED: PersistedShape = {
  * Unlock rules:
  *   - 'witch'      — survived >= 5:00 as Brawler (won OR lost)
  *   - 'sniper'     — survived >= 8:00 as Ranger (won OR lost)
- *   - 'cursed-one' — any run won (boss beaten)
+ *   - 'cursed-one' — survived >= 6:00 with any character (won OR lost). The
+ *                    6:00 mark sits just past the Hollow choice (5:00), so this
+ *                    rewards players who made the Hollow commitment and pushed
+ *                    a little past it — the old "beat the boss" gate locked it
+ *                    behind 95% of runs and nobody saw the character.
  */
 function computeCharacterUnlocks(
   outcome: 'won' | 'lost',
@@ -120,7 +139,9 @@ function computeCharacterUnlocks(
   const earned: string[] = [];
   if (characterId === 'brawler' && timeMs >= 300_000) earned.push('witch');
   if (characterId === 'ranger' && timeMs >= 480_000) earned.push('sniper');
-  if (outcome === 'won') earned.push('cursed-one');
+  if (timeMs >= 360_000) earned.push('cursed-one');
+  // `outcome` is intentionally unused for cursed-one now — survival alone unlocks.
+  void outcome;
 
   if (earned.length === 0) return [...current];
   const set = new Set(current);
@@ -196,6 +217,8 @@ export const useMetaStore = create<MetaState>()(
       setSfxVolume: (v) => set((s) => ({ settings: { ...s.settings, sfxVolume: v } })),
       setScreenShake: (b) => set((s) => ({ settings: { ...s.settings, screenShake: b } })),
 
+      setTutorialSeen: (b) => set({ tutorialSeen: b }),
+
       resetAll: () => set({ ...DEFAULT_PERSISTED }),
     }),
     {
@@ -214,11 +237,16 @@ export const useMetaStore = create<MetaState>()(
         unlocks: state.unlocks,
         unlockedCharacterIds: state.unlockedCharacterIds,
         dailyBestTimeMs: state.dailyBestTimeMs,
+        tutorialSeen: state.tutorialSeen,
       }),
       // On hydration, validate schemaVersion.
       //   v1 -> v2: add `playerName: ''`.
       //   v2 -> v3: seed `unlockedCharacterIds` with the starters.
       //   v3 -> v4: seed `dailyBestTimeMs` with empty object.
+      //   v4 -> v5: add `tutorialSeen: false`. EXISTING players already know how
+      //             to play (they have prior save data), so we intentionally
+      //             skip the tutorial for them by setting `true` instead of
+      //             `false`. Only brand-new saves see the hints.
       // Migrations chain through if multiple versions out of date.
       // Discard anything older/newer we don't recognize.
       merge: (persisted, current) => {
@@ -233,37 +261,52 @@ export const useMetaStore = create<MetaState>()(
         }
 
         if (v === 1) {
-          // v1 -> v2 -> v3 -> v4: add playerName, seed unlockedCharacterIds,
-          // initialize dailyBestTimeMs.
-          console.info('[meta] migrating save v1 -> v4 (added playerName, unlockedCharacterIds, dailyBestTimeMs)');
+          // v1 -> v5: add playerName, seed unlockedCharacterIds, init
+          // dailyBestTimeMs, mark tutorial as already seen (returning player).
+          console.info('[meta] migrating save v1 -> v5 (added playerName, unlockedCharacterIds, dailyBestTimeMs, tutorialSeen)');
           const migrated: Partial<MetaState> = {
             ...(persisted as Partial<MetaState>),
             playerName: '',
             unlockedCharacterIds: [...STARTER_CHARACTER_IDS],
             dailyBestTimeMs: {},
+            tutorialSeen: true,
             schemaVersion: SCHEMA_VERSION,
           };
           return { ...current, ...migrated };
         }
 
         if (v === 2) {
-          // v2 -> v3 -> v4: seed unlockedCharacterIds + dailyBestTimeMs.
-          console.info('[meta] migrating save v2 -> v4 (added unlockedCharacterIds, dailyBestTimeMs)');
+          // v2 -> v5: seed unlockedCharacterIds + dailyBestTimeMs + skip tutorial.
+          console.info('[meta] migrating save v2 -> v5 (added unlockedCharacterIds, dailyBestTimeMs, tutorialSeen)');
           const migrated: Partial<MetaState> = {
             ...(persisted as Partial<MetaState>),
             unlockedCharacterIds: [...STARTER_CHARACTER_IDS],
             dailyBestTimeMs: {},
+            tutorialSeen: true,
             schemaVersion: SCHEMA_VERSION,
           };
           return { ...current, ...migrated };
         }
 
         if (v === 3) {
-          // v3 -> v4: initialize dailyBestTimeMs.
-          console.info('[meta] migrating save v3 -> v4 (added dailyBestTimeMs)');
+          // v3 -> v5: initialize dailyBestTimeMs + skip tutorial.
+          console.info('[meta] migrating save v3 -> v5 (added dailyBestTimeMs, tutorialSeen)');
           const migrated: Partial<MetaState> = {
             ...(persisted as Partial<MetaState>),
             dailyBestTimeMs: {},
+            tutorialSeen: true,
+            schemaVersion: SCHEMA_VERSION,
+          };
+          return { ...current, ...migrated };
+        }
+
+        if (v === 4) {
+          // v4 -> v5: add tutorialSeen. Existing players already played pre-v5,
+          // so we count them as having seen the tutorial.
+          console.info('[meta] migrating save v4 -> v5 (added tutorialSeen)');
+          const migrated: Partial<MetaState> = {
+            ...(persisted as Partial<MetaState>),
+            tutorialSeen: true,
             schemaVersion: SCHEMA_VERSION,
           };
           return { ...current, ...migrated };

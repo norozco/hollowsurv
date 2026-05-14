@@ -1,46 +1,71 @@
 // Entry point. Mounts React + boots Phaser.
 // Owner: Agent C1 (Phaser boot only); React mount is shared with Agent C5.
+//
+// Bundle-size optimisation: Phaser (~1.2 MB) and the scene modules that drag
+// it in are loaded via dynamic import() *after* React's first paint, so the
+// title-screen experience starts as soon as the React + vendor chunks land.
+// The Phaser canvas pops in shortly after; the menu doesn't need it.
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import Phaser from 'phaser';
 import { eventBus } from './core/eventBus';
 import { subscribeVoice } from './core/audio';
 import { subscribeMusic } from './core/music';
 import { useRunStore } from './stores/runStore';
-import { BootScene } from './scenes/BootScene';
-import { ArenaScene } from './scenes/ArenaScene';
 import { App } from './react/App';
+import { ErrorBoundary } from './react/components/ErrorBoundary';
 import { readBuildFromUrl } from './core/buildCodes';
+import { setGame } from './core/gameContext';
 
-// 1. Mount React HUD.
+// 1. Mount React HUD. ErrorBoundary catches any thrown error inside the React
+// tree and shows a friendly fallback panel instead of a blank page.
 const rootEl = document.getElementById('root');
 if (!rootEl) throw new Error('main: #root element missing');
 createRoot(rootEl).render(
   <StrictMode>
-    <App />
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
   </StrictMode>
 );
 
-// 2. Boot Phaser.
-const phaserParent = document.getElementById('phaser-root');
-const phaserConfig: Phaser.Types.Core.GameConfig = {
-  type: Phaser.AUTO,
-  parent: phaserParent ?? 'phaser-root',
-  width: window.innerWidth,
-  height: window.innerHeight,
-  backgroundColor: '#05050a',
-  pixelArt: false,
-  scale: {
-    mode: Phaser.Scale.RESIZE,
-    autoCenter: Phaser.Scale.CENTER_BOTH,
-  },
-  scene: [BootScene, ArenaScene],
-  // physics not used — we run our own ECS sim on top of Phaser scenes.
-};
+// 2. Boot Phaser asynchronously so the React menu can paint without waiting
+//    for the ~1.2 MB Phaser bundle. The three import()s run in parallel and
+//    end up in their own chunks (phaser vendor + BootScene + ArenaScene).
+async function bootPhaser(): Promise<void> {
+  const [phaserMod, bootMod, arenaMod] = await Promise.all([
+    import('phaser'),
+    import('./scenes/BootScene'),
+    import('./scenes/ArenaScene'),
+  ]);
+  const Phaser = phaserMod.default;
+  const { BootScene } = bootMod;
+  const { ArenaScene } = arenaMod;
 
-const game = new Phaser.Game(phaserConfig);
-// Expose for dev console only.
-(globalThis as { __game?: Phaser.Game }).__game = game;
+  const phaserParent = document.getElementById('phaser-root');
+  const phaserConfig: Phaser.Types.Core.GameConfig = {
+    type: Phaser.AUTO,
+    parent: phaserParent ?? 'phaser-root',
+    width: window.innerWidth,
+    height: window.innerHeight,
+    backgroundColor: '#05050a',
+    pixelArt: false,
+    scale: {
+      mode: Phaser.Scale.RESIZE,
+      autoCenter: Phaser.Scale.CENTER_BOTH,
+    },
+    scene: [BootScene, ArenaScene],
+    // physics not used — we run our own ECS sim on top of Phaser scenes.
+  };
+
+  const game = new Phaser.Game(phaserConfig);
+  // Register with the typed gameContext singleton (the canonical way for
+  // systems to resolve the scene).
+  setGame(game);
+  // Also expose on globalThis for the dev console workflow. Production code
+  // should NOT read this — use `getArenaScene()` from `core/gameContext`.
+  (globalThis as { __game?: Phaser.Game }).__game = game;
+}
+void bootPhaser();
 
 // 3. Wire eventBus -> runStore translator (single subscriber).
 //    This is the one place ECS events become UI state.

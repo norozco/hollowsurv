@@ -25,12 +25,14 @@
 //     defensively, so the hash is correct regardless of system reordering.
 
 import { addComponent, addEntity, defineQuery, hasComponent, removeEntity } from 'bitecs';
-import Phaser from 'phaser';
 
 import { eventBus } from '../../core/eventBus';
-import { acquireEntity, PoolKind } from '../../core/pool';
+import { getArenaScene } from '../../core/gameContext';
+import { acquireEntity, PoolKind, POOL_CAPS } from '../../core/pool';
+import { rng } from '../../core/rng';
 import { scratchIdBuffer, growIdBuffer } from '../../core/scratch';
 import {
+  BossTag,
   Damage,
   Dead,
   Health,
@@ -54,7 +56,6 @@ import {
 import {
   DEFAULT_PROJECTILE_LIFETIME_MS,
   PROJECTILE_LIFETIME_MS_BY_WEAPON,
-  SAWBLADE_ANGULAR_SPEED_RAD_PER_SEC,
   WEAPONS,
   applyFrostSlow,
   isEnemySlowed,
@@ -66,9 +67,20 @@ import { UPGRADES } from '../../content/upgrades';
 import { getCharacter } from '../../content/characters';
 import { useRunStore } from '../../stores/runStore';
 import { hasSynergy, tickSynergies } from './synergies';
+import { resetAuraVisuals, syncAuraVisuals } from './auraVisuals';
+import {
+  ensureOrbiters,
+  isOrbiter as orbiterIsOrbiter,
+  resetOrbiters,
+  tickOrbiters,
+} from './orbiter';
 import type { Component } from 'bitecs';
 import type { World } from '../world';
 import type { WeaponDefinition } from '../../content/weapons';
+
+// Re-export so projectile.ts (which imports `isOrbiter` from autoAttack) keeps
+// working with the same import surface after the orbiter split.
+export const isOrbiter = orbiterIsOrbiter;
 
 // Player query — used to find the player eid for owner / aim source.
 const playerQuery = defineQuery([PlayerTag, Position]);
@@ -95,6 +107,8 @@ export function resetAutoAttack(): void {
   weaponEidByWeaponId.clear();
   lastSeenPlayerEid = -1;
   resetPlayerInvuln();
+  resetAuraVisuals();
+  resetOrbiters();
 }
 
 export function autoAttackSystem(world: World, dtMs: number): void {
@@ -165,83 +179,16 @@ export function autoAttackSystem(world: World, dtMs: number): void {
   }
 
   // Sync aura visual rings to follow the player.
-  syncAuraVisuals(playerEid);
+  syncAuraVisuals(world, playerEid);
 
   // Tick orbiters (sawblade) so they revolve around the player.
   tickOrbiters(playerEid, dtMs / 1000);
 }
 
-// --- aura visual ring ------------------------------------------------------
-// Three stacked concentric circles per equipped aura weapon = soft gradient.
-// Cheaper than a real radial gradient and works in Phaser 4 out of the box.
-
-interface AuraVisual {
-  outer: Phaser.GameObjects.Arc;
-  mid: Phaser.GameObjects.Arc;
-  inner: Phaser.GameObjects.Arc;
-}
-const AURA_RINGS: Map<number, AuraVisual> = new Map();
-
-function findAuraScene(): Phaser.Scene | null {
-  const game = (globalThis as { __game?: Phaser.Game }).__game;
-  if (!game) return null;
-  const scene = game.scene.getScene('ArenaScene');
-  if (!scene || !game.scene.isActive('ArenaScene')) return null;
-  return scene;
-}
-
-function syncAuraVisuals(playerEid: number): void {
-  const scene = findAuraScene();
-  if (!scene) return;
-  const px = Position.x[playerEid] ?? 0;
-  const py = Position.y[playerEid] ?? 0;
-
-  const weaponEntities = weaponSlotQuery(useRunStoreWorld());
-  // Track which weapon eids are aura this tick so we can clean up unequipped ones.
-  const stillEquipped = new Set<number>();
-  for (let i = 0; i < weaponEntities.length; i++) {
-    const eid = weaponEntities[i];
-    if (eid === undefined) continue;
-    const num = WeaponSlot.weaponId[eid] ?? 0;
-    const def = weaponDefByNum(num);
-    if (!def || def.archetype !== 'aura') continue;
-    stillEquipped.add(eid);
-    const level = WeaponSlot.level[eid] ?? 1;
-    const lvEffect = weaponLevelEffect(def, level);
-    const radius = lvEffect.radius ?? 100;
-    let ring = AURA_RINGS.get(eid);
-    if (!ring) {
-      // 3 stacked circles with decreasing radius and increasing alpha → fake
-      // radial gradient. No stroke. Depth 5 keeps it under the player (100).
-      const outer = scene.add.circle(px, py, 1, def.tint, 0.06).setScale(radius).setDepth(5);
-      const mid = scene.add.circle(px, py, 1, def.tint, 0.10).setScale(radius * 0.7).setDepth(5);
-      const inner = scene.add.circle(px, py, 1, def.tint, 0.16).setScale(radius * 0.4).setDepth(5);
-      ring = { outer, mid, inner };
-      AURA_RINGS.set(eid, ring);
-    } else {
-      ring.outer.x = px; ring.outer.y = py; ring.outer.setScale(radius);
-      ring.mid.x = px; ring.mid.y = py; ring.mid.setScale(radius * 0.7);
-      ring.inner.x = px; ring.inner.y = py; ring.inner.setScale(radius * 0.4);
-    }
-  }
-  // Remove rings whose weapon is no longer equipped (rare but possible).
-  for (const [eid, ring] of AURA_RINGS) {
-    if (!stillEquipped.has(eid)) {
-      ring.outer.destroy();
-      ring.mid.destroy();
-      ring.inner.destroy();
-      AURA_RINGS.delete(eid);
-    }
-  }
-}
-
-// Helper: get the world from somewhere we can access. autoAttackSystem already
-// has world; we expose it via a closure-private cache for the aura sync.
+// Closure-private cache for the world reference. Used by the lazy upgrade /
+// damage / character event subscriptions below — they fire outside the system
+// tick so they can't get `world` from a parameter.
 let _lastWorld: World | null = null;
-function useRunStoreWorld(): World {
-  // Fallback: empty world results in empty query. Real world set at top of system.
-  return _lastWorld!;
-}
 
 // --- upgrade_chosen subscription: apply stat multipliers to ECS Stats -----
 // Lazy-subscribed on first system tick. Reads UPGRADES dict, applies augment
@@ -439,7 +386,11 @@ function fireWeapon(
     return fireBoomerangWeapon(world, def, ownerEid, level, dmgMul, enemyHash);
   }
   if (def.archetype === 'orbiter') {
-    return ensureOrbiters(world, def, ownerEid, level);
+    // The orbiter module is generic — it needs the weapon entity eid to key
+    // its ORBITERS_BY_WEAPON map (autoAttack owns the weaponId -> eid map so
+    // the lookup stays here).
+    const weaponEid = weaponEidByWeaponId.get(def.id) ?? -1;
+    return ensureOrbiters(world, def, ownerEid, level, weaponEid);
   }
   if (def.archetype === 'mortar') {
     return fireMortarWeapon(world, def, ownerEid, level, dmgMul, enemyHash);
@@ -530,8 +481,15 @@ function fireProjectileWeapon(
   Projectile.homing[projEid] = lvEffect.homing ? 1 : 0;
   Sprite.textureIndex[projEid] = 0;
   Sprite.tint[projEid] = def.tint;
-  Sprite.scale[projEid] = 1;
+  // Evolved projectiles render slightly larger / brighter to signal the upgrade.
+  Sprite.scale[projEid] = lvEffect.forceCrit ? 1.4 : 1;
   Sprite.rotation[projEid] = Math.atan2(dirY, dirX);
+
+  // Phantom Shot: every projectile is a guaranteed crit. The collision system
+  // reads `PROJECTILE_FORCE_CRIT[projEid]` to bypass the random roll. Clear
+  // first so a recycled projectile slot doesn't carry the flag from a prior
+  // life — the projectile pool re-uses eids aggressively.
+  PROJECTILE_FORCE_CRIT[projEid] = lvEffect.forceCrit ? 1 : 0;
 
   eventBus.emit({
     type: 'weapon_fired',
@@ -594,6 +552,9 @@ function fireAuraWeapon(
       });
       // Mark Dead so collision pass skips and lifetimeSystem recycles.
       ensureComponent(world, Dead, eid);
+      // Boss kill via aura must trigger run_won — collision.ts handles this
+      // for projectile hits, but non-projectile kill paths need explicit wiring.
+      emitRunWonIfBoss(world, eid);
     }
   }
 
@@ -642,6 +603,7 @@ function fireFrostNovaWeapon(
       const ey = Position.y[eid] ?? 0;
       eventBus.emit({ type: 'enemy_killed', enemy: eid, killer: ownerEid, position: { x: ex, y: ey } });
       ensureComponent(world, Dead, eid);
+      emitRunWonIfBoss(world, eid);
     }
   }
 
@@ -653,7 +615,7 @@ function fireFrostNovaWeapon(
 }
 
 function spawnFrostBurstVisual(x: number, y: number, radius: number, tint: number): void {
-  const scene = findAuraScene();
+  const scene = getArenaScene();
   if (!scene) return;
   const ring = scene.add.circle(x, y, 1, tint, 0.45).setDepth(6).setScale(8);
   ring.setStrokeStyle(3, tint, 0.9);
@@ -684,7 +646,8 @@ function fireLightningWeapon(
   // "crit-extended" or normal — keeps the visual coherent.
   if (hasSynergy('chainstrike')) {
     const critChance = useRunStore.getState().player.critChance;
-    if (critChance > 0 && Math.random() < critChance) {
+    // Use rng() so Chainstrike crit roll is deterministic under Daily Seed.
+    if (critChance > 0 && rng() < critChance) {
       chainCount *= 2;
     }
   }
@@ -715,6 +678,7 @@ function fireLightningWeapon(
       if (nextHp <= 0) {
         eventBus.emit({ type: 'enemy_killed', enemy: target, killer: ownerEid, position: { x: ex, y: ey } });
         ensureComponent(world, Dead, target);
+        emitRunWonIfBoss(world, target);
       }
     }
 
@@ -748,7 +712,7 @@ function fireLightningWeapon(
 const LIGHTNING_CHAIN_RANGE = 220;
 
 function spawnLightningVisual(points: { x: number; y: number }[], tint: number): void {
-  const scene = findAuraScene();
+  const scene = getArenaScene();
   if (!scene || points.length < 2) return;
   for (let i = 1; i < points.length; i++) {
     const a = points[i - 1]!;
@@ -766,7 +730,45 @@ function spawnLightningVisual(points: { x: number; y: number }[], tint: number):
 
 // --- boomerang: thrown projectile that flips velocity at lifetime midpoint -
 
-const BOOMERANG_FLIP_AT_MS = new Float32Array(2048); // proj eid -> performance.now() to flip
+// Sized off the projectile pool cap so this can never silently corrupt if
+// POOL_CAPS[Projectile] is raised. +1 because eids are 1-based at boundary;
+// +small margin keeps a few slots safe against off-by-one if the pool ever
+// grows during init. Indexed by projectile eid.
+const BOOMERANG_FLIP_AT_MS = new Float32Array(POOL_CAPS[PoolKind.Projectile] + 64);
+
+// --- evolution side-channels --------------------------------------------
+// One Uint8Array per per-projectile evolution flag. Reusing the same shape
+// keeps allocation predictable and lookup branch-free (just `arr[eid] === 1`).
+// The collision system reads `PROJECTILE_FORCE_CRIT` to honour Phantom Shot's
+// guaranteed crit; `RICOCHETS_REMAINING` lets `projectileSystem` bounce
+// Eternal Return projectiles off arena edges before lifetime expiry.
+const PROJECTILE_FORCE_CRIT = new Uint8Array(POOL_CAPS[PoolKind.Projectile] + 64);
+const RICOCHETS_REMAINING = new Uint8Array(POOL_CAPS[PoolKind.Projectile] + 64);
+
+/** Read whether the projectile must crit on every hit (Phantom Shot). */
+export function isForceCritProjectile(projEid: number): boolean {
+  if (projEid < 0 || projEid >= PROJECTILE_FORCE_CRIT.length) return false;
+  return PROJECTILE_FORCE_CRIT[projEid] === 1;
+}
+
+/**
+ * Read the remaining number of ricochets for a projectile. Used by
+ * projectileSystem to reflect Eternal Return off arena edges. Returns 0
+ * for non-ricochet projectiles, which lets the caller no-op cheaply.
+ */
+export function getRicochetsRemaining(projEid: number): number {
+  if (projEid < 0 || projEid >= RICOCHETS_REMAINING.length) return 0;
+  return RICOCHETS_REMAINING[projEid] ?? 0;
+}
+
+/** Decrement the ricochet count for a projectile. Returns the new value. */
+export function consumeRicochet(projEid: number): number {
+  if (projEid < 0 || projEid >= RICOCHETS_REMAINING.length) return 0;
+  const cur = RICOCHETS_REMAINING[projEid] ?? 0;
+  if (cur <= 0) return 0;
+  RICOCHETS_REMAINING[projEid] = cur - 1;
+  return cur - 1;
+}
 
 export function isBoomerang(projEid: number): boolean {
   if (projEid < 0 || projEid >= BOOMERANG_FLIP_AT_MS.length) return false;
@@ -839,122 +841,82 @@ function fireBoomerangWeapon(
   if (projEid < BOOMERANG_FLIP_AT_MS.length) {
     BOOMERANG_FLIP_AT_MS[projEid] = performance.now() + lifetimeMs / 2;
   }
+  // Eternal Return: arena-edge ricochets. Vanilla Boomerang leaves
+  // ricochetCount undefined so RICOCHETS_REMAINING ends up 0 (no bounce).
+  // Always clear the slot so a recycled projectile doesn't carry a stale value.
+  if (projEid < RICOCHETS_REMAINING.length) {
+    RICOCHETS_REMAINING[projEid] = lvEffect.ricochetCount ?? 0;
+  }
 
   eventBus.emit({ type: 'weapon_fired', weaponId: def.id, source: ownerEid, targetEid: target });
   eventBus.emit({ type: 'projectile_spawned', projectile: projEid, weaponId: def.id });
   return true;
 }
 
-// --- orbiter (sawblade): persistent entities orbiting the player ----------
-
-interface OrbiterState {
-  eid: number;
-  angle: number; // current orbit angle in radians
-}
-/** weaponEid -> array of OrbiterState. One entry per orbiting blade. */
-const ORBITERS_BY_WEAPON: Map<number, OrbiterState[]> = new Map();
-
-export function isOrbiter(projEid: number): boolean {
-  for (const list of ORBITERS_BY_WEAPON.values()) {
-    for (const o of list) if (o.eid === projEid) return true;
-  }
-  return false;
-}
-
-export function tickOrbiters(playerEid: number, dtSec: number): void {
-  const px = Position.x[playerEid] ?? 0;
-  const py = Position.y[playerEid] ?? 0;
-  for (const list of ORBITERS_BY_WEAPON.values()) {
-    for (const o of list) {
-      o.angle += SAWBLADE_ANGULAR_SPEED_RAD_PER_SEC * dtSec;
-      const r = ORBITER_RADII.get(o.eid) ?? 95;
-      Position.x[o.eid] = px + Math.cos(o.angle) * r;
-      Position.y[o.eid] = py + Math.sin(o.angle) * r;
-      Velocity.vx[o.eid] = 0;
-      Velocity.vy[o.eid] = 0;
-    }
-  }
-}
-
-const ORBITER_RADII: Map<number, number> = new Map();
-
-function ensureOrbiters(world: World, def: WeaponDefinition, ownerEid: number, level: number): boolean {
-  // Find or create the weapon entity for this weapon (we need a key).
-  let weaponEid = -1;
-  for (const [id, eid] of weaponEidByWeaponId) {
-    if (id === def.id) { weaponEid = eid; break; }
-  }
-  if (weaponEid < 0) return false;
-
-  const lvEffect = weaponLevelEffect(def, level);
-  const targetCount = Math.max(1, lvEffect.projectileCount ?? 1);
-  const radius = lvEffect.radius ?? 95;
-  const dmgMul = Stats.damageMul[ownerEid] ?? 1;
-  const dmg = lvEffect.damage * dmgMul;
-
-  let list = ORBITERS_BY_WEAPON.get(weaponEid);
-  if (!list) {
-    list = [];
-    ORBITERS_BY_WEAPON.set(weaponEid, list);
-  }
-
-  // Adjust count: spawn up to target, despawn extras.
-  while (list.length < targetCount) {
-    const projEid = acquireEntity(world, PoolKind.Projectile);
-    ensureComponent(world, Position, projEid);
-    ensureComponent(world, Velocity, projEid);
-    ensureComponent(world, Hitbox, projEid);
-    ensureComponent(world, Damage, projEid);
-    ensureComponent(world, Lifetime, projEid);
-    ensureComponent(world, Projectile, projEid);
-    ensureComponent(world, ProjectileTag, projEid);
-    ensureComponent(world, Sprite, projEid);
-
-    Position.x[projEid] = Position.x[ownerEid] ?? 0;
-    Position.y[projEid] = Position.y[ownerEid] ?? 0;
-    Velocity.vx[projEid] = 0;
-    Velocity.vy[projEid] = 0;
-    Hitbox.radius[projEid] = def.hitboxRadius ?? 14;
-    Damage.amount[projEid] = dmg;
-    // Orbiters never expire on their own — set huge lifetime; tickOrbiters keeps them alive.
-    Lifetime.remainingMs[projEid] = 1e9;
-    Projectile.pierce[projEid] = -1; // hits everything
-    Projectile.ownerEid[projEid] = ownerEid;
-    Projectile.homing[projEid] = 0;
-    Sprite.textureIndex[projEid] = 0;
-    Sprite.tint[projEid] = def.tint;
-    Sprite.scale[projEid] = 1;
-    Sprite.rotation[projEid] = 0;
-
-    ORBITER_RADII.set(projEid, radius);
-    const startAngle = (list.length / targetCount) * Math.PI * 2;
-    list.push({ eid: projEid, angle: startAngle });
-  }
-  // Update damage on all existing orbiters (in case level changed).
-  for (const o of list) {
-    Damage.amount[o.eid] = dmg;
-    ORBITER_RADII.set(o.eid, radius);
-  }
-
-  // Sync angles so existing orbiters spread evenly each level-up.
-  if (list.length > 0) {
-    for (let i = 0; i < list.length; i++) {
-      // keep current rotation but normalize spacing — not strictly required; cheap to skip.
-    }
-  }
-
-  // Don't reset cooldown — orbiters are persistent, not "fired" per shot.
-  // Returning true makes autoAttackSystem set a cooldown anyway, which is fine
-  // (orbiters tick continuously regardless).
-  return true;
-}
-
 // --- mortar: explosion on impact or lifetime expiry -----------------------
 
-const MORTAR_PROJECTILES: Map<number, { radius: number; damage: number; tint: number }> = new Map();
+interface MortarShellData {
+  radius: number;
+  damage: number;
+  tint: number;
+  /** Carpet Bomb only: spawn this many sub-detonations around the impact site. 0 = vanilla mortar. */
+  subMortarCount: number;
+}
+const MORTAR_PROJECTILES: Map<number, MortarShellData> = new Map();
 export function isMortar(projEid: number): boolean {
   return MORTAR_PROJECTILES.has(projEid);
 }
+
+/**
+ * Apply mortar splash damage at (cx, cy) for `radius` and `damage`. Shared by
+ * primary detonations and Carpet Bomb sub-detonations (which deliberately
+ * skip the sub-detonation cascade — sub-mortars never spawn their own subs).
+ */
+function applyMortarSplash(
+  world: World,
+  enemyHashAccess: ReturnType<typeof getEnemyHash>,
+  cx: number,
+  cy: number,
+  radius: number,
+  damage: number,
+  tint: number,
+  ownerEid: number,
+): void {
+  growIdBuffer(64);
+  enemyHashAccess.queryRadius(cx, cy, radius, scratchIdBuffer);
+  for (let i = 0; i < scratchIdBuffer.length; i++) {
+    const eid = scratchIdBuffer[i];
+    if (eid === undefined) continue;
+    if (hasComponent(world, Dead, eid)) continue;
+    const curHp = Health.hp[eid] ?? 0;
+    if (curHp <= 0) continue;
+    const next = curHp - damage;
+    Health.hp[eid] = next;
+    eventBus.emit({ type: 'damage_dealt', target: eid, source: ownerEid, amount: damage, isCrit: false });
+    if (next <= 0) {
+      const ex = Position.x[eid] ?? 0;
+      const ey = Position.y[eid] ?? 0;
+      eventBus.emit({ type: 'enemy_killed', enemy: eid, killer: ownerEid, position: { x: ex, y: ey } });
+      ensureComponent(world, Dead, eid);
+      emitRunWonIfBoss(world, eid);
+    }
+  }
+  // Visual: brief ring at impact.
+  const scene = getArenaScene();
+  if (scene) {
+    const ring = scene.add.circle(cx, cy, 1, tint, 0.6).setDepth(8).setScale(8);
+    ring.setStrokeStyle(2, tint, 0.95);
+    scene.tweens.add({
+      targets: ring,
+      scale: radius,
+      alpha: 0,
+      duration: 320,
+      ease: 'Cubic.out',
+      onComplete: () => ring.destroy(),
+    });
+  }
+}
+
 export function detonateMortar(
   world: World,
   projEid: number,
@@ -965,38 +927,46 @@ export function detonateMortar(
   MORTAR_PROJECTILES.delete(projEid);
   const x = Position.x[projEid] ?? 0;
   const y = Position.y[projEid] ?? 0;
-  growIdBuffer(64);
-  enemyHashAccess.queryRadius(x, y, data.radius, scratchIdBuffer);
   const ownerEid = Projectile.ownerEid[projEid] ?? 0;
-  for (let i = 0; i < scratchIdBuffer.length; i++) {
-    const eid = scratchIdBuffer[i];
-    if (eid === undefined) continue;
-    if (hasComponent(world, Dead, eid)) continue;
-    const curHp = Health.hp[eid] ?? 0;
-    if (curHp <= 0) continue;
-    const next = curHp - data.damage;
-    Health.hp[eid] = next;
-    eventBus.emit({ type: 'damage_dealt', target: eid, source: ownerEid, amount: data.damage, isCrit: false });
-    if (next <= 0) {
-      const ex = Position.x[eid] ?? 0;
-      const ey = Position.y[eid] ?? 0;
-      eventBus.emit({ type: 'enemy_killed', enemy: eid, killer: ownerEid, position: { x: ex, y: ey } });
-      ensureComponent(world, Dead, eid);
+
+  // Primary detonation.
+  applyMortarSplash(world, enemyHashAccess, x, y, data.radius, data.damage, data.tint, ownerEid);
+
+  // Carpet Bomb cluster: spawn `subMortarCount` sub-explosions at evenly-spaced
+  // offsets around the primary. Each sub does the same radius/damage as the
+  // primary but is rolled out over a short stagger (200ms each) so the player
+  // sees a chain of impacts rather than one fat ring. Sub-detonations route
+  // through `applyMortarSplash` directly so they bypass the sub-cascade.
+  if (data.subMortarCount > 0) {
+    const scene = getArenaScene();
+    const offset = data.radius * 0.9;
+    for (let i = 0; i < data.subMortarCount; i++) {
+      const angle = (i / data.subMortarCount) * Math.PI * 2;
+      const ox = x + Math.cos(angle) * offset;
+      const oy = y + Math.sin(angle) * offset;
+      const delayMs = 200 + i * 100;
+      // Brief "incoming" marker — small dot that pulses up to the detonation size.
+      if (scene) {
+        const marker = scene.add.circle(ox, oy, 1, data.tint, 0.4).setDepth(7).setScale(3);
+        marker.setStrokeStyle(1, data.tint, 0.6);
+        scene.tweens.add({
+          targets: marker,
+          scale: 8,
+          alpha: 0.8,
+          duration: delayMs,
+          ease: 'Quad.in',
+          onComplete: () => marker.destroy(),
+        });
+      }
+      // Fire the sub-detonation after the delay. The world reference here is
+      // captured in the closure — safe because mortar lifetimes are short and
+      // the run/world is destroyed via the autoAttack reset path.
+      setTimeout(() => {
+        if (useRunStore.getState().phase !== 'playing') return;
+        const hash = getEnemyHash();
+        applyMortarSplash(world, hash, ox, oy, data.radius, data.damage, data.tint, ownerEid);
+      }, delayMs);
     }
-  }
-  // Visual: brief ring at impact.
-  const scene = findAuraScene();
-  if (scene) {
-    const ring = scene.add.circle(x, y, 1, data.tint, 0.6).setDepth(8).setScale(8);
-    ring.setStrokeStyle(2, data.tint, 0.95);
-    scene.tweens.add({
-      targets: ring,
-      scale: data.radius,
-      alpha: 0,
-      duration: 320,
-      ease: 'Cubic.out',
-      onComplete: () => ring.destroy(),
-    });
   }
 }
 
@@ -1054,7 +1024,14 @@ function fireMortarWeapon(
   Sprite.scale[projEid] = 1;
   Sprite.rotation[projEid] = Math.atan2(dirY, dirX);
 
-  MORTAR_PROJECTILES.set(projEid, { radius, damage: damageAmount, tint: def.tint });
+  MORTAR_PROJECTILES.set(projEid, {
+    radius,
+    damage: damageAmount,
+    tint: def.tint,
+    // Carpet Bomb: detonateMortar reads this and scatters N sub-mortars at the
+    // impact site. Vanilla mortar omits the field so subMortarCount stays 0.
+    subMortarCount: lvEffect.subMortarCount ?? 0,
+  });
 
   eventBus.emit({ type: 'weapon_fired', weaponId: def.id, source: ownerEid, targetEid: target });
   eventBus.emit({ type: 'projectile_spawned', projectile: projEid, weaponId: def.id });
@@ -1164,6 +1141,10 @@ function fireBladeWeapon(
   const baseDamage = lvEffect.damage * dmgMul;
   // Frostbite synergy (Blade + Frost Nova): blade strikes deal 3x to slowed enemies.
   const frostbiteActive = hasSynergy('frostbite');
+  // Reaper's Edge: if execBelowFrac is set, enemies whose post-strike HP is
+  // below this fraction of their max are instantly executed (clamped to 0).
+  // Vanilla Blade leaves this undefined so the branch is a no-op.
+  const execBelowFrac = lvEffect.execBelowFrac ?? 0;
   let strikePos: { x: number; y: number } | null = null;
 
   for (let i = 0; i < scratchIdBuffer.length; i++) {
@@ -1173,7 +1154,17 @@ function fireBladeWeapon(
     const curHp = Health.hp[eid] ?? 0;
     if (curHp <= 0) continue;
     const dmg = frostbiteActive && isEnemySlowed(eid) ? baseDamage * 3 : baseDamage;
-    const next = curHp - dmg;
+    let next = curHp - dmg;
+    // Execution check. Bosses are intentionally included — the brief reads
+    // "instantly kill enemies below 15% HP", and treating bosses as immune
+    // would silently weaken the evolution for the only fight that matters at
+    // 10:00. Capping at 1.0 keeps the floor sensible.
+    if (next > 0 && execBelowFrac > 0) {
+      const maxHp = Health.maxHp[eid] ?? next;
+      if (maxHp > 0 && next < maxHp * execBelowFrac) {
+        next = 0;
+      }
+    }
     Health.hp[eid] = next;
     if (!strikePos) {
       strikePos = { x: Position.x[eid] ?? ox, y: Position.y[eid] ?? oy };
@@ -1184,6 +1175,7 @@ function fireBladeWeapon(
       const ey = Position.y[eid] ?? 0;
       eventBus.emit({ type: 'enemy_killed', enemy: eid, killer: ownerEid, position: { x: ex, y: ey } });
       ensureComponent(world, Dead, eid);
+      emitRunWonIfBoss(world, eid);
     }
   }
 
@@ -1201,7 +1193,7 @@ function spawnBladeSlashVisual(
   radius: number,
   tint: number,
 ): void {
-  const scene = findAuraScene();
+  const scene = getArenaScene();
   if (!scene) return;
   // A short, fast crescent-like swoosh: a thin arc that expands and fades.
   const angle = Math.atan2(toward.y - oy, toward.x - ox);
@@ -1236,6 +1228,28 @@ function ensureComponent(world: World, comp: Component, eid: number): void {
   if (!hasComponent(world, comp, eid)) {
     addComponent(world, comp, eid);
   }
+}
+
+/**
+ * If the just-killed `eid` carries `BossTag`, emit `run_won` so the meta
+ * stats / end-screen flow fires. Mirrors the pattern in
+ * `collision.applyDamageToEnemy`; needed in every non-projectile kill path
+ * (aura, frost nova, chain lightning, blade melee, mortar AoE, Hollowfield
+ * pulse, orbiter — but orbiters route through the projectile collision pass
+ * which already handles this).
+ *
+ * Call AFTER you've emitted `enemy_killed` and tagged the entity `Dead`,
+ * so the kill count in the `run_won` payload is +1 from `store.kills`.
+ */
+function emitRunWonIfBoss(world: World, eid: number): void {
+  if (!hasComponent(world, BossTag, eid)) return;
+  const store = useRunStore.getState();
+  eventBus.emit({
+    type: 'run_won',
+    timeMs: store.elapsedMs,
+    level: store.player.level,
+    kills: store.kills + 1, // +1 for the kill we just emitted
+  });
 }
 
 // --- Hollowfield synergy pulse --------------------------------------------
@@ -1292,6 +1306,7 @@ function triggerHollowfieldPulse(world: World, playerEid: number): void {
       const ey = Position.y[eid] ?? 0;
       eventBus.emit({ type: 'enemy_killed', enemy: eid, killer: playerEid, position: { x: ex, y: ey } });
       ensureComponent(world, Dead, eid);
+      emitRunWonIfBoss(world, eid);
     }
   }
 }

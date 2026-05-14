@@ -16,6 +16,7 @@
 // (`bargain_offered`, `bargain_accepted`, `bargain_passed`) and so must not be
 // renamed without a save/telemetry migration.
 
+import { rng } from '../core/rng';
 import { useRunStore } from '../stores/runStore';
 import { WEAPONS } from './weapons';
 
@@ -57,7 +58,8 @@ const bargainPool: BargainDefinition[] = [
         // runStore (MAX_WEAPON_LEVEL). We replicate the constant here.
         const upgradable = weapons.filter((w) => w.level < 8);
         if (upgradable.length > 0) {
-          const pick = upgradable[Math.floor(Math.random() * upgradable.length)]!;
+          // Use rng() so the bargain target weapon is deterministic under Daily Seed.
+          const pick = upgradable[Math.floor(rng() * upgradable.length)]!;
           const idx = weapons.findIndex((w) => w.id === pick.id);
           if (idx !== -1 && weapons[idx]) {
             weapons[idx] = { ...weapons[idx]!, level: weapons[idx]!.level + 1 };

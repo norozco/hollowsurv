@@ -18,6 +18,7 @@ import { useMetaStore } from '../../stores/metaStore';
 import { WEAPONS } from '../../content/weapons';
 import { CHARACTERS } from '../../content/characters';
 import { HOLLOWS } from '../../content/hollows';
+import { t } from '../../content/strings';
 import { buildShareUrl, snapshotFromRunStore } from '../../core/buildCodes';
 
 function formatTime(ms: number): string {
@@ -184,16 +185,16 @@ export function PauseMenu(): ReactElement {
     if (cb && typeof cb.writeText === 'function') {
       cb.writeText(url).then(
         () => {
-          setCopyMsg('Copied!');
+          setCopyMsg(t('copied'));
           window.setTimeout(() => setCopyMsg(''), 1500);
         },
         () => {
-          setCopyMsg('Copy failed');
+          setCopyMsg(t('copyFailed'));
           window.setTimeout(() => setCopyMsg(''), 1500);
         }
       );
     } else {
-      setCopyMsg('Clipboard unavailable');
+      setCopyMsg(t('clipboardUnavailable'));
       window.setTimeout(() => setCopyMsg(''), 1500);
     }
   }
@@ -213,7 +214,7 @@ export function PauseMenu(): ReactElement {
   return (
     <div style={ROOT_STYLE}>
       <div style={PANEL_STYLE}>
-        <h2 style={TITLE_STYLE}>PAUSED</h2>
+        <h2 style={TITLE_STYLE}>{t('paused')}</h2>
 
         {playerName ? (
           <div style={{ textAlign: 'center', fontSize: 14, opacity: 0.8 }}>
@@ -223,15 +224,15 @@ export function PauseMenu(): ReactElement {
         ) : null}
 
         <button onClick={resume} style={PRIMARY_BUTTON}>
-          Resume (Esc)
+          {t('resume')}
         </button>
 
         {/* --- Settings --- */}
         <div>
-          <div style={SECTION_LABEL}>Settings</div>
+          <div style={SECTION_LABEL}>{t('sectionSettings')}</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 10 }}>
             <div style={SLIDER_ROW}>
-              <span>Music</span>
+              <span>{t('ctlMusic')}</span>
               <input
                 type="range"
                 min={0}
@@ -246,7 +247,7 @@ export function PauseMenu(): ReactElement {
               </span>
             </div>
             <div style={SLIDER_ROW}>
-              <span>Sounds</span>
+              <span>{t('ctlSounds')}</span>
               <input
                 type="range"
                 min={0}
@@ -274,75 +275,85 @@ export function PauseMenu(): ReactElement {
                 checked={screenShake}
                 onChange={(e) => setScreenShake(e.target.checked)}
               />
-              Screen shake
+              {t('ctlScreenShake')}
             </label>
           </div>
         </div>
 
         {/* --- Controls --- */}
         <div>
-          <div style={SECTION_LABEL}>Controls</div>
+          <div style={SECTION_LABEL}>{t('sectionControls')}</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 10 }}>
             <div style={KEYBIND_ROW}>
               <span style={KEY_CAP}>WASD</span>
-              <span>Move</span>
+              <span>{t('keyMove')}</span>
             </div>
             <div style={KEYBIND_ROW}>
               <span style={KEY_CAP}>C</span>
-              <span>Toggle manual aim</span>
+              <span>{t('keyManualAim')}</span>
             </div>
             <div style={KEYBIND_ROW}>
               <span style={KEY_CAP}>E</span>
-              <span>Accept Devil's Bargain</span>
+              <span>{t('keyAcceptBargain')}</span>
             </div>
             <div style={KEYBIND_ROW}>
               <span style={KEY_CAP}>1 / 2 / 3</span>
-              <span>Pick level-up choice</span>
+              <span>{t('keyPickLevelup')}</span>
             </div>
             <div style={KEYBIND_ROW}>
               <span style={KEY_CAP}>Esc</span>
-              <span>Pause / Resume</span>
+              <span>{t('keyPause')}</span>
+            </div>
+            <div
+              style={{
+                fontSize: 11,
+                opacity: 0.65,
+                marginTop: 6,
+                lineHeight: 1.5,
+              }}
+            >
+              {t('controlsFootnote')}
             </div>
           </div>
         </div>
 
         {/* --- Current Run --- */}
         <div>
-          <div style={SECTION_LABEL}>Current Run</div>
+          <div style={SECTION_LABEL}>{t('sectionCurrentRun')}</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 10 }}>
             <div style={STAT_ROW}>
-              <span style={{ opacity: 0.6 }}>Character</span>
+              <span style={{ opacity: 0.6 }}>{t('labelCharacter')}</span>
               <span>{character?.name ?? characterId}</span>
             </div>
             <div style={STAT_ROW}>
-              <span style={{ opacity: 0.6 }}>Time</span>
+              <span style={{ opacity: 0.6 }}>{t('labelTime')}</span>
               <span style={{ fontVariantNumeric: 'tabular-nums' }}>{formatTime(elapsedMs)}</span>
             </div>
             <div style={STAT_ROW}>
-              <span style={{ opacity: 0.6 }}>Kills</span>
+              <span style={{ opacity: 0.6 }}>{t('labelKills')}</span>
               <span style={{ fontVariantNumeric: 'tabular-nums' }}>{kills}</span>
             </div>
             <div style={STAT_ROW}>
-              <span style={{ opacity: 0.6 }}>Level</span>
+              <span style={{ opacity: 0.6 }}>{t('labelLevel')}</span>
               <span style={{ fontVariantNumeric: 'tabular-nums' }}>{playerLevel}</span>
             </div>
             <div style={STAT_ROW}>
-              <span style={{ opacity: 0.6 }}>HP</span>
+              <span style={{ opacity: 0.6 }}>{t('labelHp')}</span>
               <span style={{ fontVariantNumeric: 'tabular-nums' }}>
                 {Math.round(playerHp)} / {Math.round(playerMaxHp)}
               </span>
             </div>
             {hollow ? (
               <div style={STAT_ROW}>
-                <span style={{ opacity: 0.6 }}>Hollow</span>
+                <span style={{ opacity: 0.6 }}>{t('labelHollow')}</span>
                 <span>{hollow.name}</span>
               </div>
             ) : null}
             <div style={STAT_ROW}>
-              <span style={{ opacity: 0.6 }}>Weapons</span>
+              <span style={{ opacity: 0.6 }}>{t('labelWeapons')}</span>
               <span>
                 {weapons.length === 0
-                  ? '(none)'
+                  ? t('weaponsNone')
                   : weapons
                       .map((w) => `${WEAPONS[w.id]?.name ?? w.id} L${w.level}`)
                       .join(', ')}
@@ -353,19 +364,19 @@ export function PauseMenu(): ReactElement {
 
         {/* --- Share Build --- */}
         <div>
-          <div style={SECTION_LABEL}>Share This Run</div>
+          <div style={SECTION_LABEL}>{t('sectionShareThisRun')}</div>
           <button
             onClick={copyBuild}
             style={{ ...SECONDARY_BUTTON, width: '100%', marginTop: 10 }}
           >
-            {copyMsg || 'Copy Build Code URL'}
+            {copyMsg || t('copyBuildCodeUrl')}
           </button>
         </div>
 
         {/* --- End Run --- */}
         <div style={{ marginTop: 4 }}>
           <button onClick={quit} style={DANGER_BUTTON}>
-            End Run (records as a loss)
+            {t('endRunDanger')}
           </button>
         </div>
       </div>

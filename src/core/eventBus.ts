@@ -28,7 +28,16 @@ export type GameEvent =
   | { type: 'bargain_accepted'; bargainId: string }
   | { type: 'bargain_passed'; bargainId: string }
   | { type: 'hollow_choice_offered' }
-  | { type: 'hollow_chosen'; hollowId: string };
+  | { type: 'hollow_chosen'; hollowId: string }
+  | {
+      type: 'weapon_evolved';
+      /** Base (pre-evolution) weapon id, e.g. 'auto-pistol'. */
+      baseWeaponId: string;
+      /** Evolved weapon id, e.g. 'phantom-shot'. */
+      evolvedWeaponId: string;
+      /** Display name of the evolved weapon, shown on the toast. */
+      evolvedName: string;
+    };
 
 export type GameEventType = GameEvent['type'];
 

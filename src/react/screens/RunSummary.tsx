@@ -18,6 +18,7 @@ import { useShallow } from 'zustand/react/shallow';
 import { useMetaStore } from '../../stores/metaStore';
 import { useRunStore } from '../../stores/runStore';
 import { todaysKey } from '../../core/rng';
+import { t } from '../../content/strings';
 import { buildShareUrl, encodeBuild, snapshotFromRunStore } from '../../core/buildCodes';
 
 function formatTime(ms: number): string {
@@ -93,6 +94,12 @@ export function RunSummary(): ReactElement {
   const setPhase = useRunStore((s) => s.setPhase);
   const isDailyMode = useRunStore((s) => s.isDailyMode);
   const selectedCharacterId = useRunStore((s) => s.selectedCharacterId);
+  // Death recap fields. All four are reset on startRun and accumulated through
+  // _applyEvent so by the time this screen renders, they're final.
+  const comboPeakThisRun = useRunStore((s) => s.comboPeakThisRun);
+  const damageDealtTotal = useRunStore((s) => s.damageDealtTotal);
+  const damageTakenTotal = useRunStore((s) => s.damageTakenTotal);
+  const lastKillerName = useRunStore((s) => s.lastKillerName);
 
   const playerName = useMetaStore((s) => s.playerName) || 'Stranger';
   const dailyBestTimeMs = useMetaStore((s) => s.dailyBestTimeMs);
@@ -107,8 +114,8 @@ export function RunSummary(): ReactElement {
 
   const fullTitle = runEpithet ? `${playerName} ${runEpithet}` : playerName;
   const flavor = won
-    ? `${fullTitle} stands above the Hollow.`
-    : `Sleep well, ${fullTitle}.`;
+    ? t('victoryFlavor', { title: fullTitle })
+    : t('defeatFlavor', { title: fullTitle });
 
   // In daily mode the restart re-enters the daily seed. In normal mode it
   // re-rolls the run with the same character.
@@ -130,16 +137,16 @@ export function RunSummary(): ReactElement {
     if (clipboard && typeof clipboard.writeText === 'function') {
       clipboard.writeText(url).then(
         () => {
-          setShareMsg('Copied!');
+          setShareMsg(t('copied'));
           window.setTimeout(() => setShareMsg(''), 1500);
         },
         () => {
-          setShareMsg('Copy failed');
+          setShareMsg(t('copyFailed'));
           window.setTimeout(() => setShareMsg(''), 1500);
         }
       );
     } else {
-      setShareMsg('Clipboard unavailable');
+      setShareMsg(t('clipboardUnavailable'));
       window.setTimeout(() => setShareMsg(''), 1500);
     }
   };
@@ -148,14 +155,14 @@ export function RunSummary(): ReactElement {
     <div style={ROOT_STYLE}>
       {isDailyMode ? (
         <div style={{ fontSize: 14, opacity: 0.9, color: '#a9d8b1', letterSpacing: 2, marginBottom: -8 }}>
-          DAILY SEED: {dailyKey}
+          {t('dailySeedLabel', { date: dailyKey })}
         </div>
       ) : null}
       <div style={{ fontSize: 28, letterSpacing: 4, opacity: 0.9, textAlign: 'center' }}>
         {fullTitle.toUpperCase()}
       </div>
       <h1 style={{ margin: 0, fontSize: 56, color: won ? '#7d8' : '#d77' }}>
-        {won ? 'Victory' : 'Defeated'}
+        {won ? t('victoryHeading') : t('defeatedHeading')}
       </h1>
       <div style={{ fontSize: 18, fontStyle: 'italic', opacity: 0.85, textAlign: 'center', maxWidth: 640 }}>
         {flavor}
@@ -167,9 +174,49 @@ export function RunSummary(): ReactElement {
       </div>
       {isDailyMode ? (
         <div style={{ fontSize: 14, opacity: 0.85, fontVariantNumeric: 'tabular-nums', color: '#a9d8b1' }}>
-          Today's Best: {todaysBestMs === null ? '—' : formatTime(todaysBestMs)}
+          {t('todaysBestLabel', { time: todaysBestMs === null ? t('timeDash') : formatTime(todaysBestMs) })}
         </div>
       ) : null}
+      {/* Death recap. Only show "Killed by" when the player actually lost AND
+          we resolved a killer name. The other three stats render whenever
+          they're meaningful (>0 or >1 combo). */}
+      {(lastKillerName !== '' || comboPeakThisRun > 1 || damageDealtTotal > 0 || damageTakenTotal > 0) && (
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 6,
+            padding: '14px 22px',
+            background: 'rgba(0, 0, 0, 0.35)',
+            border: '1px solid rgba(255, 255, 255, 0.08)',
+            borderRadius: 6,
+            fontSize: 14,
+            fontVariantNumeric: 'tabular-nums',
+          }}
+        >
+          {!won && lastKillerName !== '' ? (
+            <div style={{ color: '#e8a0a0' }}>
+              Killed by: <span style={{ fontWeight: 700 }}>{lastKillerName}</span>
+            </div>
+          ) : null}
+          {comboPeakThisRun > 1 ? (
+            <div style={{ color: '#ffd86a' }}>
+              Longest combo: <span style={{ fontWeight: 700 }}>×{comboPeakThisRun}</span>
+            </div>
+          ) : null}
+          {damageDealtTotal > 0 ? (
+            <div style={{ opacity: 0.9 }}>
+              Damage dealt: <span style={{ fontWeight: 700 }}>{Math.round(damageDealtTotal).toLocaleString()}</span>
+            </div>
+          ) : null}
+          {damageTakenTotal > 0 ? (
+            <div style={{ opacity: 0.85 }}>
+              Damage taken: <span style={{ fontWeight: 700 }}>{Math.round(damageTakenTotal).toLocaleString()}</span>
+            </div>
+          ) : null}
+        </div>
+      )}
       {weapons.length > 0 && (
         <div style={{ fontSize: 13, opacity: 0.8 }}>
           Weapons:{' '}
@@ -178,10 +225,10 @@ export function RunSummary(): ReactElement {
       )}
       <div style={{ display: 'flex', gap: 12, marginTop: 12 }}>
         <button onClick={onRestart} style={BUTTON_STYLE}>
-          {isDailyMode ? 'Restart Daily' : 'Restart'}
+          {isDailyMode ? t('restartDaily') : t('restart')}
         </button>
         <button onClick={() => setPhase('menu')} style={BUTTON_STYLE}>
-          Back to Menu
+          {t('backToMenu')}
         </button>
       </div>
       <div
@@ -195,7 +242,7 @@ export function RunSummary(): ReactElement {
       >
         <div style={BUILD_CODE_STYLE}>{buildCode}</div>
         <button onClick={onShareBuild} style={SHARE_BUTTON_STYLE}>
-          {shareMsg || 'Share This Build'}
+          {shareMsg || t('shareThisBuild')}
         </button>
       </div>
     </div>

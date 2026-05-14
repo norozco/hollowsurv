@@ -4,11 +4,12 @@ Status snapshot for picking up after a reboot or new Claude session.
 
 ## TL;DR
 
-A feature-complete bullet-heaven survivors-like.
+A feature-complete bullet-heaven survivors-like, post-CTO-audit hardened.
 - **Live**: https://norozco.github.io/hollowsurv/
 - **Repo**: https://github.com/norozco/hollowsurv
 - **Auto-deploys** on `git push origin main` via GitHub Actions (~1 min)
 - **Local dev**: `cd "C:\Desktop\Code claude\hollowsurv" && npm run dev` → http://localhost:5173/hollowsurv/
+- **Tests**: `npm test` → 27 passing across rng/buildCodes/pool/runStore/metaStore
 
 ## Stack
 
@@ -95,13 +96,38 @@ Game freezes, three portals appear. 30s auto-pick = Bone.
 - **Build codes**: `?b=BR-bld5.frn3.lit2_crit.spl.tho` URLs encode character + weapons + augments. "Copy Build" button on level-up + run summary. URL on load = auto-applies on next startRun.
 - **Daily Seed**: "Daily Run" button on title screen. Mulberry32 RNG → deterministic spawns + level-up offers + epithet. Personal best stored per-date in localStorage.
 
-### Persistence (metaStore SCHEMA_VERSION = 4)
+### Persistence (metaStore SCHEMA_VERSION = 5)
 - `playerName` — set once, persists
 - `totalRuns`, `totalWins`, `bestRunTimeMs` (longest survival, any outcome)
 - `unlockedCharacterIds` — starts with `['ranger', 'brawler']`
 - `dailyBestTimeMs: { 'YYYY-MM-DD': ms }`
 - `settings: { musicVolume, sfxVolume, screenShake }`
-- Auto-migrates from v1/v2/v3 → v4
+- `tutorialSeen` — first-run onboarding hints gate
+- Auto-migrates from v1/v2/v3/v4 → v5
+
+### Weapon evolutions (5)
+Pair a base weapon at L5 with the right augment to evolve:
+- **Phantom Shot** (Piercer L5 + Crit) — auto-pistol that crits 100% and pierces forever
+- **Hollow Field** (Aura L5 + Thorns) — aura that grows + slows on tick
+- **Reapers Edge** (Blade L5 + Berserker) — blade radius doubled, always-on berserker bonus
+- **Carpet Bomb** (Mortar L5 + Splash) — mortar drops 3 shells in a wedge
+- **Eternal Return** (Boomerang L5 + Attack Speed) — boomerang chains 3 returns per cast
+
+### Critical-fixes sprint (6 phases, all shipped)
+Post-CTO-audit hardening pass:
+- **1A** — determinism: crit roll, heal drop, bargain pick, Chainstrike crit all use `rng()` not `Math.random`
+- **1B** — pause actually pauses: `scene.tweens.pauseAll()` + `scene.time.paused = true` + voice queue gated on phase
+- **1C** — `ErrorBoundary` catches React crashes, `FpsOverlay` (F3), `SettingsModal` from main menu
+- **2A** — per-PoolKind cached component lists; `damage.ts` system removed (redundant)
+- **2B** — floating damage numbers + death puffs (pooled), event-bus screen shake (camera.ts)
+- **2C** — `ComboCounter` (kill streaks + milestone flashes), `OnboardingHints` (first-run only)
+- **3A** — BossTag added to ALL kill paths (aura/frost/lightning/orbiter/hollow-curse/Hollowfield)
+- **3B** — 5 weapon evolutions wired through `synergies.ts`, `weapon_evolved` event + toast
+- **3C** — `TouchControls`: virtual joystick + aim circle via `touchInput.ts` bridge
+- **4A** — `vite.config.ts` `manualChunks` splits phaser/react/zustand vendor bundles
+- **5** — `batchedRender.ts` single Graphics object, per-entity rectangles removed from spawnDirector/projectile/xp
+- **6A** — `gameContext.ts` singleton replaces `globalThis.__game`; `auraVisuals.ts` + `orbiter.ts` extracted from autoAttack (1474→1314 lines)
+- **6B** — Vitest + jsdom, 27/27 tests; `strings.ts` i18n scaffold (`t()` helper) wired into 4 React screens
 
 ## Architecture
 
@@ -128,33 +154,42 @@ public/assets/audio/
 src/
   main.tsx — entry. Mounts React + Phaser. Subscribes voice + music. Reads URL build code.
   core/
-    audio.ts — voice layer (HTMLAudio, event-bus driven)
-    music.ts — music layer (crossfade state machine)
+    audio.ts — voice layer (HTMLAudio pools 3x/clip, ducks music, pause-gated queue)
+    music.ts — music layer (crossfade state machine + duckMusicFor)
     buildCodes.ts — encode/decode/snapshot URL build codes
     rng.ts — Mulberry32 seedable RNG for Daily Seed
     eventBus.ts — typed pub/sub
+    gameContext.ts — singleton (setGame/getGame/getArenaScene); replaces globalThis.__game
+    touchInput.ts — virtual joystick + aim bridge into ECS input
     pool.ts, spatialHash.ts, flowfield.ts, scratch.ts — perf primitives
+    __tests__/ — rng / buildCodes / pool vitest specs
   content/
     characters.ts (5)
-    weapons.ts (13)
+    weapons.ts (13 base + 5 evolutions)
     enemies.ts (3 + 4 bosses)
     upgrades.ts (12)
     bargains.ts (10)
     hollows.ts (3 + bone/ember/tide mechanic refs)
     epithets.ts (12 strings)
+    strings.ts — i18n keys + t() helper (66 entries)
     waves.ts
   ecs/
     components.ts — bitECS components (locked contract)
     world.ts
-    systems/ — input, flowfield, movement, spawnDirector, autoAttack, projectile, collision,
-      damage, pickup, xp, lifetime, bargain, hollowMechanics, synergies, camera, render
+    systems/ — input, flowfield, movement, spawnDirector, autoAttack, auraVisuals, orbiter,
+      projectile, collision, pickup, xp, lifetime, bargain, hollowMechanics, synergies,
+      damageNumbers, screenShake, batchedRender, camera, render
   scenes/
     BootScene.ts, ArenaScene.ts
   stores/
     runStore.ts, metaStore.ts
+    __tests__/ — runStore / metaStore vitest specs
   react/
-    App.tsx — phase router
-    screens/ — MainMenu, NameEntryScreen, HUD, LevelUpPicker, RunSummary,
+    App.tsx — phase router (mounts ErrorBoundary, FpsOverlay, TouchControls, ComboCounter, OnboardingHints)
+    components/
+      ErrorBoundary.tsx
+    screens/ — MainMenu, NameEntryScreen, HUD, LevelUpPicker, RunSummary, PauseMenu,
+      SettingsModal, FpsOverlay, ComboCounter, OnboardingHints, TouchControls,
       BargainOverlay, HollowChoiceScreen, SynergyToast
 ```
 
@@ -167,13 +202,11 @@ src/
 
 ## Known issues / TODO
 
-1. **bitECS pinned 0.3.40** (legacy API). Migration to 0.4.x = full system rewrite.
-2. **SpriteGPULayer not wired** — `render.ts` is a stub. Placeholder rectangles/circles in use. Performance budget assumes the eventual swap.
-3. **Some `bargainBoosts` fields are written but not read yet** — `spawnRateMul`, `bossSpawnOffsetMs`, `xpMul`, `damageMul`, `damageTakenMul`, `invulnUntilMs`, `reviveTokens`. Bargain agent's report lists which systems still need to consume these for full effect. Already-wired: `attackSpeedMul`, `moveSpeedMul`, `pickupRadiusMul`, `critChance`, `damageReduction`, weapon array mutations.
-4. **No settings UI** — `musicVolume`, `sfxVolume`, `screenShake` exist in metaStore but no slider yet.
-5. **Real leaderboard (Phase 2 of daily seed)** — local only for now. Needs Supabase or similar backend.
-6. **`longshot` projectile lifetime** falls through to default (1500ms). Add to `PROJECTILE_LIFETIME_MS_BY_WEAPON` if tighter range cap is needed.
-7. **Phaser asset pipeline** — pixel art monster pack from Pita ($12) not yet purchased. When acquired, drop PNGs in `public/assets/monsters/`, load in BootScene, swap rectangles for sprites in spawnDirector.
+1. **bitECS pinned 0.3.40** (legacy API). Migration to 0.4.x = full system rewrite. Deferred to dedicated 1-month branch.
+2. **Procedural rendering, not sprites** — `batchedRender.ts` draws shapes via a single Graphics object. Pixel art pack (Pita, $12) not yet purchased. When acquired, drop PNGs in `public/assets/monsters/`, load in BootScene, swap shape draws for sprite blits.
+3. **Server-backed leaderboard** — daily seed PBs are localStorage-only. Needs Supabase + Discord OAuth (deferred).
+4. **`longshot` projectile lifetime** falls through to default (1500ms). Add to `PROJECTILE_LIFETIME_MS_BY_WEAPON` if tighter range cap is needed.
+5. **i18n is scaffold-only** — `t()` helper + `strings.ts` exist and are wired into MainMenu/PauseMenu/RunSummary/ErrorBoundary, but only English strings ship. Add second locale + locale switch to fully validate.
 
 ## Credits (CC-BY compliance)
 - Music: "Purgatory Vol 3" by David KBD — https://davidkbd.itch.io/purgatory-vol-3-extreme-metal-music-pack (CC-BY 4.0)

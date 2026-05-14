@@ -1,13 +1,15 @@
-// Writes Position/Sprite to the SpriteGPULayer (or fallback Sprite GameObjects).
-// Owner: split — render binding lives here, but sprite atlas + GPU layer setup is C1's call.
-// TODO(agentC1/C3): when SpriteGPULayer API is confirmed for installed Phaser version,
-// swap out the standard Phaser.GameObjects.Sprite fallback for a single batched draw.
+// Legacy render system entry point.
+//
+// Hollowsurv now uses `batchedRender.ts` (single Phaser.Graphics redrawn each
+// tick) wired directly into `ArenaScene.update()`. This file is kept as a
+// no-op stub so any out-of-tree imports (tests, dev tools, prior commits)
+// don't break while the migration settles. Safe to delete in a follow-up.
 import type { World } from '../world';
 
 /**
- * Tick the render system. Reads Position + Sprite; writes to GPU layer.
- * Last system in the tick order.
+ * No-op. The active renderer is `batchedRenderSystem` in
+ * `src/ecs/systems/batchedRender.ts`. ArenaScene.update calls that one.
  */
 export function renderSystem(_world: World, _dt: number): void {
-  // Stub. Implementation pending — see TODO above.
+  /* batchedRender owns the draw pass — see src/ecs/systems/batchedRender.ts */
 }

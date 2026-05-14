@@ -3,12 +3,18 @@
 //
 // Tick order (per ARCHITECTURE.md §3 / CONTRACTS.md §6):
 //   inputSystem -> flowfieldSystem -> movementSystem -> spawnDirectorSystem ->
-//   autoAttackSystem -> projectileSystem -> collisionSystem -> damageSystem ->
-//   pickupSystem -> xpSystem -> lifetimeSystem -> cameraSystem -> renderSystem
+//   autoAttackSystem -> projectileSystem -> collisionSystem ->
+//   hollowMechanicsSystem -> pickupSystem -> xpSystem -> lifetimeSystem ->
+//   bargainSystem -> cameraSystem -> batchedRenderSystem
 //
-// Currently only input/movement/camera are wired; the rest are no-op stubs
-// owned by other agents (C2/C3/C4). Their ordering is preserved so the
-// pipeline lights up without further scene changes.
+// (damageSystem was removed — see import block below.)
+//
+// Rendering: enemies, projectiles, and pickups are now drawn by the batched
+// renderer (`batchedRender.ts`) — a single `Phaser.GameObjects.Graphics`
+// redrawn each tick from ECS Position + Sprite components. Replaces the
+// previous per-entity Rectangle/Arc visuals across spawnDirector / xp /
+// projectile. The player + auras + damage numbers + weapon flourish tweens
+// retain their own GameObjects (they're either singletons or short-lived).
 import Phaser from 'phaser';
 import { addComponent, addEntity } from 'bitecs';
 import { eventBus } from '../core/eventBus';
@@ -31,14 +37,24 @@ import { spawnDirectorSystem } from '../ecs/systems/spawnDirector';
 import { autoAttackSystem } from '../ecs/systems/autoAttack';
 import { projectileSystem } from '../ecs/systems/projectile';
 import { collisionSystem } from '../ecs/systems/collision';
-import { damageSystem } from '../ecs/systems/damage';
+// damageSystem deleted: it was a safety-net pass whose conditions
+// (hp<=0 && !Dead) never fire — every damage source in collision.ts and
+// autoAttack.ts tags Dead inline and emits enemy_killed / run_lost
+// directly. Keeping the call wasted a query per tick (~99% no-ops).
+// See audit Issue #3.
 import { pickupSystem } from '../ecs/systems/pickup';
 import { xpSystem } from '../ecs/systems/xp';
 import { lifetimeSystem } from '../ecs/systems/lifetime';
 import { bindCamera, cameraSystem, unbindCamera } from '../ecs/systems/camera';
-import { renderSystem } from '../ecs/systems/render';
+import {
+  batchedRenderSystem,
+  bindBatchedRender,
+  unbindBatchedRender,
+} from '../ecs/systems/batchedRender';
 import { bargainSystem } from '../ecs/systems/bargain';
 import { hollowMechanicsSystem } from '../ecs/systems/hollowMechanics';
+import { bindScreenShake, unbindScreenShake } from '../ecs/systems/screenShake';
+import { resetDamageNumbers } from '../ecs/systems/damageNumbers';
 import { HOLLOWS } from '../content/hollows';
 import { useRunStore } from '../stores/runStore';
 import type { RunPhase } from '../stores/runStore';
@@ -76,6 +92,10 @@ export class ArenaScene extends Phaser.Scene {
   private readonly backgroundDefaultTint = 0x0a0a12;
   /** Last selectedHollowId we applied a tint for; null = default tint active. */
   private lastAppliedHollowId: string | null = null;
+  /** performance.now() at the moment we entered a non-'playing' phase. Null
+   *  while playing. Used to shift runStartedAtMs forward on resume so pause
+   *  duration doesn't count toward elapsedMs (speedrun-timing fix). */
+  private pauseStartedAtMs: number | null = null;
 
   constructor() {
     super({ key: 'ArenaScene' });
@@ -181,13 +201,33 @@ export class ArenaScene extends Phaser.Scene {
     // 6. Wire input + camera (one-shot binds; systems read these each tick).
     bindInput(this, eid);
     bindCamera(this, this.playerSprite, eid);
+    // Batched procedural renderer. Single Graphics object drawn into each
+    // tick — replaces per-entity Rectangle/Arc GameObjects for enemies,
+    // projectiles, and pickups. Depth 1 sits just above the background +
+    // grid; auras (5), mortar/frost rings (6-8), and the player (100) all
+    // layer above it. See `bindBatchedRender` for the full depth stack.
+    bindBatchedRender(this);
+    // Screen shake on boss_spawned + damage_dealt (target=player). The handler
+    // gates on metaStore.settings.screenShake so the pause-menu toggle wins.
+    bindScreenShake();
 
     // 7. Phase mirror — read once now, subscribe for updates.
-    //    Also detect run-start transitions to show the announcement overlay.
+    //    Also detect run-start transitions to show the announcement overlay,
+    //    AND pause/resume Phaser-side state (tweens + scene clock) so visual
+    //    effects don't keep running through the pause menu.
     this.phaseMirror = useRunStore.getState().phase;
+    // Initial Phaser-side pause state in case the scene starts in a non-playing
+    // phase (e.g. menu before first run).
+    this.applyPhaserPauseForPhase(this.phaseMirror);
     this.unsubscribePhase = useRunStore.subscribe((s) => {
       const prev = this.phaseMirror;
       this.phaseMirror = s.phase;
+      // Phaser-side pause: tweens + scene clock follow the simulation phase.
+      // 'paused', 'levelup', and 'hollow_select' are all simulation-frozen
+      // states — visual tweens and delayedCall timers should freeze with them.
+      if (s.phase !== prev) {
+        this.applyPhaserPauseForPhase(s.phase);
+      }
       // Announcement fires on entering 'playing' with a fresh runStartedAtMs.
       // Comparing against lastAnnouncedRunStartedAtMs prevents double-firing
       // when phase wobbles (playing -> levelup -> playing) within one run.
@@ -230,7 +270,11 @@ export class ArenaScene extends Phaser.Scene {
     // Update elapsed time on the run store for the HUD.
     const store = useRunStore.getState();
     if (store.runStartedAtMs > 0) {
-      useRunStore.setState({ elapsedMs: performance.now() - store.runStartedAtMs });
+      const nextElapsed = performance.now() - store.runStartedAtMs;
+      useRunStore.setState({ elapsedMs: nextElapsed });
+      // Decay the combo counter when its 2s window has lapsed. The store
+      // action is a no-op when combo is already 0 (the fast path).
+      store._tickComboDecay(nextElapsed);
     }
 
     const w = this.world;
@@ -244,14 +288,15 @@ export class ArenaScene extends Phaser.Scene {
     autoAttackSystem(w, delta); // C3
     projectileSystem(w, delta); // C3
     collisionSystem(w, delta); // C3
-    damageSystem(w, delta); // C3
+    // damageSystem removed — see import block above. Tick order now jumps
+    // straight from collision -> hollowMechanics -> pickup -> ...
     hollowMechanicsSystem(w, delta); // Branching Hollows — per-Hollow per-tick logic.
     pickupSystem(w, delta); // C4
     xpSystem(w, delta); // C4
     lifetimeSystem(w, delta); // C3
     bargainSystem(w, delta); // Devil's Bargain — offer timer + auto-pass.
     cameraSystem(w, delta);
-    renderSystem(w, delta); // C3 (later — SpriteGPULayer)
+    batchedRenderSystem(w, delta); // single-graphics procedural batch
   }
 
   /**
@@ -313,6 +358,46 @@ export class ArenaScene extends Phaser.Scene {
   }
 
   /**
+   * Apply Phaser-side pause to match the simulation phase.
+   *
+   * Pauses tweens (so frost-burst rings, blade slashes, mortar expansions,
+   * the run announcement, devil's bargain glow etc. freeze with the sim) and
+   * the scene time clock (`this.time` — used by `delayedCall`).
+   *
+   * Simulation-frozen phases: 'paused', 'levelup', 'hollow_select'.
+   * Lifecycle phases ('menu', 'won', 'lost') don't need explicit pause —
+   * the scene either isn't running combat or is post-run; we still want
+   * tweens to play in those (e.g. menu polish), so they stay un-paused.
+   *
+   * Also shifts runStartedAtMs forward by the pause duration on resume so
+   * elapsedMs reflects pure gameplay time (speedrun timing).
+   */
+  private applyPhaserPauseForPhase(phase: RunPhase): void {
+    const shouldFreeze =
+      phase === 'paused' || phase === 'levelup' || phase === 'hollow_select';
+    if (shouldFreeze) {
+      // Enter freeze. Idempotent — Phaser's pauseAll on already-paused is fine.
+      if (this.pauseStartedAtMs === null) {
+        this.pauseStartedAtMs = performance.now();
+      }
+      this.tweens.pauseAll();
+      this.time.paused = true;
+    } else {
+      // Leave freeze. Shift runStartedAtMs so elapsedMs ignores pause time.
+      if (this.pauseStartedAtMs !== null) {
+        const pausedFor = performance.now() - this.pauseStartedAtMs;
+        const store = useRunStore.getState();
+        if (store.runStartedAtMs > 0 && pausedFor > 0) {
+          useRunStore.setState({ runStartedAtMs: store.runStartedAtMs + pausedFor });
+        }
+        this.pauseStartedAtMs = null;
+      }
+      this.tweens.resumeAll();
+      this.time.paused = false;
+    }
+  }
+
+  /**
    * Recolor the arena background to match the picked Hollow's palette. We tint
    * the BACKGROUND RECTANGLE (not the camera) — camera tints affect every
    * GameObject and cost more to revert. When `hollowId` is null the default
@@ -359,6 +444,9 @@ export class ArenaScene extends Phaser.Scene {
     }
     unbindInput();
     unbindCamera();
+    unbindBatchedRender();
+    unbindScreenShake();
+    resetDamageNumbers();
     if (this.world) {
       destroyGameWorld(this.world);
       this.world = null;
@@ -368,5 +456,6 @@ export class ArenaScene extends Phaser.Scene {
     this.playerEid = -1;
     this.backgroundFill = null;
     this.lastAppliedHollowId = null;
+    this.pauseStartedAtMs = null;
   }
 }

@@ -32,6 +32,13 @@ export interface UpgradeChoice {
   rarity: 'common' | 'rare' | 'epic';
   /** Augment effect (when kind === 'augment'). Applied by pickUpgrade. */
   augment?: import('../content/upgrades').AugmentEffect;
+  /**
+   * Evolution choice. When set, pickUpgrade removes the base weapon
+   * (`choice.weaponId`) and adds the evolved weapon (`choice.evolvesToId`)
+   * at level 1 with the evolved flag set. Reuses the `level_weapon` kind so
+   * downstream consumers don't need a new union case.
+   */
+  evolvesToId?: string;
 }
 
 export interface RunPlayerSlot {
@@ -123,6 +130,39 @@ export interface RunState {
   kills: number;
   bossKilled: boolean;
 
+  /**
+   * Survivors-style kill streak. Increments on every enemy_killed event.
+   * Resets to 0 after 2 seconds with no kill (see `comboExpiresAtMs`).
+   * The HUD/ComboCounter overlay reads this to flash milestones (×10/×25/×50/...).
+   */
+  comboCount: number;
+  /** Highest combo achieved this run. Preserved for the Run Summary. */
+  comboPeakThisRun: number;
+  /**
+   * elapsedMs at which the combo expires if no further kill happens. Set on
+   * every enemy_killed event (= elapsedMs + COMBO_WINDOW_MS). ArenaScene's
+   * update loop calls `_tickComboDecay(elapsedMs)` each tick to reset the
+   * counter once we pass this value.
+   */
+  comboExpiresAtMs: number;
+
+  /** Total damage the player dealt this run (sum of damage_dealt where source === player.eid). */
+  damageDealtTotal: number;
+  /** Total damage the player took this run (sum of damage_dealt where target === player.eid). */
+  damageTakenTotal: number;
+  /**
+   * eid of the last entity that damaged the player. Used by the Run Summary to
+   * show "Killed by: <enemy>". -1 when unset (no damage taken yet).
+   */
+  lastKillerEid: number;
+  /**
+   * Resolved name of the killer (e.g. 'brute', 'boss-prime') for the Run Summary.
+   * Empty string when no damage has been taken yet, or when the eid could not
+   * be resolved to an enemy archetype. spawnDirector.getEnemyNameForEid() is
+   * the lookup source.
+   */
+  lastKillerName: string;
+
   /** ID of the character chosen for the current/last run (default 'ranger'). */
   selectedCharacterId: string;
 
@@ -205,9 +245,19 @@ export interface RunState {
    * No-op when no choice is pending (defensive — protects against double-click).
    */
   pickHollow: (hollowId: HollowId) => void;
+  /**
+   * Reset the combo counter if `currentMs` has passed `comboExpiresAtMs`.
+   * Called from ArenaScene.update() each tick. No-op when combo is already 0.
+   */
+  _tickComboDecay: (currentMs: number) => void;
   // internal — called by event-bus translator only
   _applyEvent: (event: GameEvent) => void;
 }
+
+/** How long after a kill the combo persists with no further kills. 2s feels best
+ *  to me — long enough that a 3-second weapon cooldown doesn't break combo
+ *  mid-flow, short enough that walking away from the action lets it reset. */
+const COMBO_WINDOW_MS = 2000;
 
 /**
  * Vertical-slice placeholder weapon ids used when content/weapons.ts is empty.
@@ -258,19 +308,18 @@ const INITIAL_PLAYER: RunState['player'] = {
 };
 
 /**
- * Apply an augment's effects to a mutable player object. Used by both
- * pickUpgrade (when the player picks an augment from the level-up modal) and
- * by startRun (when a pending build snapshot is being hydrated). Pushes the
- * augment id onto player.pickedAugmentIds so build-code encoding sees it.
+ * Apply a raw `AugmentEffect` to a mutable player object. The shared core of
+ * the two augment-application paths: `applyAugmentToPlayer` (looks up an
+ * UPGRADES id, then calls this) and `pickUpgrade`'s inline fallback (which
+ * doesn't have a stable id but still has the effect inline on the choice).
  *
- * NOTE: this only mutates the runStore-side player. ECS Stats updates happen
- * via the `upgrade_chosen` event which autoAttack listens to. For startRun
- * hydration we emit the same event so weapons fire with the augmented stats.
+ * Pure mutation — does NOT touch `pickedAugmentIds`. The caller decides
+ * whether to record the id for build-code encoding.
  */
-function applyAugmentToPlayer(player: RunState['player'], augmentId: string): void {
-  const def = UPGRADES[augmentId];
-  if (!def || def.kind !== 'augment' || !def.augment) return;
-  const aug = def.augment;
+function applyAugmentEffectToPlayer(
+  player: RunState['player'],
+  aug: import('../content/upgrades').AugmentEffect,
+): void {
   if (aug.maxHpDelta) {
     player.maxHp += aug.maxHpDelta;
     player.hp = Math.min(player.maxHp, player.hp + aug.maxHpDelta);
@@ -296,6 +345,22 @@ function applyAugmentToPlayer(player: RunState['player'], augmentId: string): vo
   if (aug.damageReductionDelta) {
     player.damageReduction = 1 - (1 - player.damageReduction) * (1 - aug.damageReductionDelta);
   }
+}
+
+/**
+ * Apply an augment's effects to a mutable player object by UPGRADES id. Used
+ * by `pickUpgrade` (when the player picks an augment from the level-up modal)
+ * and by `startRun` (when a pending build snapshot is being hydrated). Pushes
+ * the augment id onto `player.pickedAugmentIds` so build-code encoding sees it.
+ *
+ * NOTE: this only mutates the runStore-side player. ECS Stats updates happen
+ * via the `upgrade_chosen` event which autoAttack listens to. For startRun
+ * hydration we emit the same event so weapons fire with the augmented stats.
+ */
+function applyAugmentToPlayer(player: RunState['player'], augmentId: string): void {
+  const def = UPGRADES[augmentId];
+  if (!def || def.kind !== 'augment' || !def.augment) return;
+  applyAugmentEffectToPlayer(player, def.augment);
   player.pickedAugmentIds.push(augmentId);
 }
 
@@ -369,15 +434,29 @@ function generateOffers(player: RunState['player'], characterId: string): Upgrad
   const ownedIds = new Set(player.weapons.map((w) => w.id));
   const weaponNames = new Map<string, string>();
 
+  // Build the set of evolved-weapon ids so we can exclude them from the
+  // "new weapon" pool — evolutions are only obtainable via the evolution
+  // gate (max level + paired augment), never as a fresh weapon pick.
+  const evolvedWeaponIds = new Set<string>();
+  for (const def of Object.values(WEAPONS)) {
+    if (def.evolvesTo) evolvedWeaponIds.add(def.evolvesTo);
+  }
+
   // Prefer real WEAPONS data if populated, else placeholder pool. Filter out
   // weapons restricted to OTHER characters so a Brawler never sees the Auto
   // Pistol (Ranger-only) and a Ranger never sees the Blade (Brawler-only).
   const weaponPool = Object.keys(WEAPONS).length > 0
     ? Object.values(WEAPONS)
         .filter((w) => !w.restrictedToCharacter || w.restrictedToCharacter === characterId)
+        .filter((w) => !evolvedWeaponIds.has(w.id))
         .map((w) => ({ id: w.id, name: w.name, description: w.description }))
     : PLACEHOLDER_WEAPON_POOL.map((w) => ({ id: w.id, name: w.name, description: '' }));
   for (const w of weaponPool) weaponNames.set(w.id, w.name);
+  // Make sure evolved-weapon display names are still resolvable for level-up
+  // cards (these can be in player.weapons after an evolution pick).
+  for (const def of Object.values(WEAPONS)) {
+    if (!weaponNames.has(def.id)) weaponNames.set(def.id, def.name);
+  }
 
   // --- candidates: new weapons (only if we have room) ---
   const newWeaponCandidates: UpgradeChoice[] =
@@ -395,8 +474,16 @@ function generateOffers(player: RunState['player'], characterId: string): Upgrad
       : [];
 
   // --- candidates: level up an existing weapon (skip if already maxed) ---
+  // "Maxed" means the slot has reached the highest entry in its definition's
+  // levels table (typically 5). The hard MAX_WEAPON_LEVEL cap (8) is a
+  // schema-level guard; the per-weapon level table is the real ceiling.
   const levelWeaponCandidates: UpgradeChoice[] = player.weapons
-    .filter((w) => w.level < MAX_WEAPON_LEVEL)
+    .filter((w) => {
+      if (w.level >= MAX_WEAPON_LEVEL) return false;
+      const def = WEAPONS[w.id];
+      if (def && w.level >= def.levels.length) return false;
+      return true;
+    })
     .map<UpgradeChoice>((w) => {
       const name = weaponNames.get(w.id) ?? w.id;
       return {
@@ -408,6 +495,43 @@ function generateOffers(player: RunState['player'], characterId: string): Upgrad
         rarity: 'common',
       };
     });
+
+  // --- candidates: evolutions ------------------------------------------------
+  // A weapon can evolve when:
+  //   1. its definition has `evolvesTo` + `evolveRequires` set,
+  //   2. the equipped slot has reached the max level entry on its level table
+  //      (vertical slice: 5),
+  //   3. the paired augment id is present in `player.pickedAugmentIds`,
+  //   4. (optional) the evolved weapon definition exists in WEAPONS,
+  //   5. the slot is not already an evolution (`evolved === false`).
+  //
+  // An evolution offer reuses the `level_weapon` kind so existing consumers
+  // (HUD card rendering, etc.) treat it like any other level-up card; the
+  // `evolvesToId` field is the only signal that pickUpgrade must do a
+  // weapon-swap instead of a level bump.
+  const evolutionCandidates: UpgradeChoice[] = [];
+  for (const slot of player.weapons) {
+    if (slot.evolved) continue;
+    const baseDef = WEAPONS[slot.id];
+    if (!baseDef || !baseDef.evolvesTo || !baseDef.evolveRequires) continue;
+    const maxLevel = baseDef.levels.length;
+    if (slot.level < maxLevel) continue;
+    const reqs = baseDef.evolveRequires;
+    if (!player.pickedAugmentIds.includes(reqs.pairedAugmentId)) continue;
+    const evolvedDef = WEAPONS[baseDef.evolvesTo];
+    if (!evolvedDef) continue;
+    // Honour evolved weapon's character restriction (e.g. Phantom Shot ranger-only).
+    if (evolvedDef.restrictedToCharacter && evolvedDef.restrictedToCharacter !== characterId) continue;
+    evolutionCandidates.push({
+      id: `evo-${baseDef.id}-${rngSuffix()}`,
+      kind: 'level_weapon',
+      title: `EVOLVE: ${evolvedDef.name}`,
+      description: evolvedDef.description,
+      weaponId: baseDef.id,
+      evolvesToId: evolvedDef.id,
+      rarity: 'epic',
+    });
+  }
 
   // --- candidates: augments ---
   const realAugments = Object.values(UPGRADES).filter((u) => u.kind === 'augment');
@@ -430,8 +554,16 @@ function generateOffers(player: RunState['player'], characterId: string): Upgrad
         }));
 
   // Combine candidate buckets and pick 3 distinct entries.
-  // Bias: each bucket contributes once if non-empty; remaining slots filled from augments.
+  // Bias:
+  //  - if an evolution is available, it always claims the first slot (this is
+  //    the genre-defining moment; surfacing it reliably matters more than
+  //    rotation diversity),
+  //  - then each remaining bucket contributes once if non-empty,
+  //  - remaining slots filled from augments.
   const offers: UpgradeChoice[] = [];
+  if (evolutionCandidates.length > 0) {
+    offers.push(...pickN(evolutionCandidates, 1));
+  }
   if (newWeaponCandidates.length > 0) {
     offers.push(...pickN(newWeaponCandidates, 1));
   }
@@ -463,6 +595,13 @@ export const useRunStore = create<RunState>((set, get) => ({
   player: INITIAL_PLAYER,
   kills: 0,
   bossKilled: false,
+  comboCount: 0,
+  comboPeakThisRun: 0,
+  comboExpiresAtMs: 0,
+  damageDealtTotal: 0,
+  damageTakenTotal: 0,
+  lastKillerEid: -1,
+  lastKillerName: '',
   pendingChoices: [],
   selectedCharacterId: DEFAULT_CHARACTER_ID,
   runEpithet: '',
@@ -550,6 +689,13 @@ export const useRunStore = create<RunState>((set, get) => ({
       player: freshPlayer,
       kills: 0,
       bossKilled: false,
+      comboCount: 0,
+      comboPeakThisRun: 0,
+      comboExpiresAtMs: 0,
+      damageDealtTotal: 0,
+      damageTakenTotal: 0,
+      lastKillerEid: -1,
+      lastKillerName: '',
       pendingChoices: [],
       pendingBuildSnapshot: null,
       selectedCharacterId: characterId,
@@ -603,6 +749,38 @@ export const useRunStore = create<RunState>((set, get) => ({
 
     const player = { ...cur.player, weapons: [...cur.player.weapons] };
 
+    // Evolution short-circuit: handled before the regular level_weapon path so
+    // a single `evolvesToId` flag is enough to swap the slot. The augment that
+    // gated the evolution stays owned (does NOT get consumed). We emit a
+    // `weapon_evolved` event so the toast / audio / future telemetry can hook in.
+    if (choice.evolvesToId && choice.weaponId) {
+      const ownedIdx = player.weapons.findIndex((w) => w.id === choice.weaponId);
+      const evolvedDef = WEAPONS[choice.evolvesToId];
+      if (ownedIdx !== -1 && evolvedDef) {
+        player.weapons[ownedIdx] = {
+          id: choice.evolvesToId,
+          level: 1,
+          evolved: true,
+        };
+        set({
+          player,
+          pendingChoices: [],
+          phase: 'playing',
+        });
+        eventBus.emit({ type: 'upgrade_chosen', choiceId });
+        eventBus.emit({
+          type: 'weapon_evolved',
+          baseWeaponId: choice.weaponId,
+          evolvedWeaponId: choice.evolvesToId,
+          evolvedName: evolvedDef.name,
+        });
+        return;
+      }
+      // Fall through to a generic level-up if the evolution couldn't be
+      // resolved (unknown evolvedDef, slot vanished, etc.) so the picker
+      // never soft-locks.
+    }
+
     if (choice.kind === 'new_weapon' && choice.weaponId) {
       // Add weapon at level 1 if not already owned and we have room.
       const ownedIdx = player.weapons.findIndex((w) => w.id === choice.weaponId);
@@ -636,38 +814,18 @@ export const useRunStore = create<RunState>((set, get) => ({
       // Fall back: walk UPGRADES and look for one whose `augment` reference
       // matches the inline choice.augment object (this is the same instance
       // because generateOffers spreads UPGRADES[id].augment directly).
+      //
+      // Both branches route through `applyAugmentEffectToPlayer` so the
+      // mutation logic lives in exactly one place. The id-resolved branch also
+      // pushes the id onto `pickedAugmentIds`; the inline-fallback branch
+      // skips that step (build codes can't replay a choice without an id).
       const upgradeId = extractUpgradeIdFromChoiceId(choice.id, choice.augment);
       if (upgradeId !== null) {
         applyAugmentToPlayer(player, upgradeId);
       } else {
         // Fallback: apply the inline effect without recording an id (so build
         // codes won't include it, but the augment still works in-run).
-        const aug = choice.augment;
-        if (aug.maxHpDelta) {
-          player.maxHp += aug.maxHpDelta;
-          player.hp = Math.min(player.maxHp, player.hp + aug.maxHpDelta);
-        }
-        if (aug.lifestealPerKill) {
-          player.lifestealPerKill += aug.lifestealPerKill;
-        }
-        if (aug.critChanceDelta) {
-          player.critChance = Math.min(1, player.critChance + aug.critChanceDelta);
-        }
-        if (aug.splashRadiusDelta) {
-          player.splashRadius = Math.max(player.splashRadius, aug.splashRadiusDelta);
-        }
-        if (aug.thornsReflectDelta) {
-          player.thornsReflect = Math.min(1, player.thornsReflect + aug.thornsReflectDelta);
-        }
-        if (aug.knockbackPxDelta) {
-          player.knockbackPx += aug.knockbackPxDelta;
-        }
-        if (aug.berserkerMulDelta) {
-          player.berserkerMul += aug.berserkerMulDelta;
-        }
-        if (aug.damageReductionDelta) {
-          player.damageReduction = 1 - (1 - player.damageReduction) * (1 - aug.damageReductionDelta);
-        }
+        applyAugmentEffectToPlayer(player, choice.augment);
       }
     }
 
@@ -727,16 +885,51 @@ export const useRunStore = create<RunState>((set, get) => ({
     eventBus.emit({ type: 'hollow_chosen', hollowId: validHollow });
   },
 
+  _tickComboDecay: (currentMs) => {
+    const cur = get();
+    // Fast path: nothing to reset.
+    if (cur.comboCount === 0) return;
+    if (currentMs <= cur.comboExpiresAtMs) return;
+    set({ comboCount: 0 });
+  },
+
   _applyEvent: (event) => {
     const cur = get();
 
     switch (event.type) {
       case 'damage_dealt': {
-        // Update HP only when the player is the target. Other agents' damage
-        // events don't affect runStore.
-        if (event.target === cur.player.eid) {
+        const playerEid = cur.player.eid;
+        // Player took damage: update HP + tracking. Some sources legitimately
+        // emit `damage_dealt` AND `player_hit` so the totals here mirror what
+        // the HP update does (same event flows through both branches in main.tsx).
+        if (event.target === playerEid) {
           const hp = Math.max(0, cur.player.hp - event.amount);
-          set({ player: { ...cur.player, hp } });
+          // Resolve killer name via spawnDirector's eid -> name map. The lookup
+          // tolerates eid = -1 (returns undefined) so non-enemy damage sources
+          // (e.g. environmental) leave lastKillerName untouched.
+          let lastKillerName = cur.lastKillerName;
+          const killerEid = event.source;
+          if (killerEid !== undefined && killerEid >= 0) {
+            // Inline require to avoid a circular import at module load.
+            // spawnDirector imports runStore (for elapsedMs); requiring it back
+            // here at call time is safe — both modules are already loaded.
+            const lookup =
+              (globalThis as { __getEnemyNameForEid?: (eid: number) => string | undefined })
+                .__getEnemyNameForEid;
+            const name = lookup ? lookup(killerEid) : undefined;
+            if (name !== undefined) lastKillerName = name;
+          }
+          set({
+            player: { ...cur.player, hp },
+            damageTakenTotal: cur.damageTakenTotal + event.amount,
+            lastKillerEid: killerEid ?? cur.lastKillerEid,
+            lastKillerName,
+          });
+          return;
+        }
+        // Player dealt damage: accumulate toward "Damage dealt: N" stat.
+        if (event.source === playerEid && playerEid >= 0) {
+          set({ damageDealtTotal: cur.damageDealtTotal + event.amount });
         }
         return;
       }
@@ -751,7 +944,12 @@ export const useRunStore = create<RunState>((set, get) => ({
 
       case 'pickup_collected': {
         if (event.kind === 'xp') {
-          let xp = cur.player.xp + event.value;
+          // Devil's Bargain: xpMul scales the value of each XP orb collected.
+          // Default identity (1) means un-bargained runs see no change. The
+          // multiplier compounds with future xp-altering bargains via the
+          // standard `xpMul *= delta` pattern in bargains.apply().
+          const xpMul = cur.bargainBoosts.xpMul;
+          let xp = cur.player.xp + event.value * xpMul;
           let level = cur.player.level;
           let xpToNext = cur.player.xpToNext;
 
@@ -808,11 +1006,26 @@ export const useRunStore = create<RunState>((set, get) => ({
 
       case 'enemy_killed': {
         const lifesteal = cur.player.lifestealPerKill ?? 0;
+        // Combo: increment + extend expiry. Peak tracked for the Run Summary.
+        const comboCount = cur.comboCount + 1;
+        const comboExpiresAtMs = cur.elapsedMs + COMBO_WINDOW_MS;
+        const comboPeakThisRun = Math.max(cur.comboPeakThisRun, comboCount);
         if (lifesteal > 0 && cur.player.hp < cur.player.maxHp) {
           const hp = Math.min(cur.player.maxHp, cur.player.hp + lifesteal);
-          set({ kills: cur.kills + 1, player: { ...cur.player, hp } });
+          set({
+            kills: cur.kills + 1,
+            player: { ...cur.player, hp },
+            comboCount,
+            comboPeakThisRun,
+            comboExpiresAtMs,
+          });
         } else {
-          set({ kills: cur.kills + 1 });
+          set({
+            kills: cur.kills + 1,
+            comboCount,
+            comboPeakThisRun,
+            comboExpiresAtMs,
+          });
         }
         return;
       }
