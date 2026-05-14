@@ -17,6 +17,7 @@ import { MainMenu } from './screens/MainMenu';
 import { SynergyToast } from './screens/SynergyToast';
 import { BargainOverlay } from './screens/BargainOverlay';
 import { HollowChoiceScreen } from './screens/HollowChoiceScreen';
+import { PauseMenu } from './screens/PauseMenu';
 
 export function App(): ReactElement {
   const phase = useRunStore((s) => s.phase);
@@ -39,6 +40,7 @@ export function App(): ReactElement {
 
       {/* Modals (mutually exclusive with each other) */}
       {phase === 'menu' && <MainMenu />}
+      {phase === 'paused' && <PauseMenu />}
       {phase === 'levelup' && <LevelUpPicker />}
       {phase === 'hollow_select' && <HollowChoiceScreen />}
       {(phase === 'won' || phase === 'lost') && <RunSummary />}
