@@ -8,7 +8,7 @@ A feature-complete bullet-heaven survivors-like.
 - **Live**: https://norozco.github.io/hollowsurv/
 - **Repo**: https://github.com/norozco/hollowsurv
 - **Auto-deploys** on `git push origin main` via GitHub Actions (~1 min)
-- **Local dev**: `cd "C:\Users\Lrgz0\Code claude\hollowsurv" && npm run dev` → http://localhost:5173/hollowsurv/
+- **Local dev**: `cd "C:\Desktop\Code claude\hollowsurv" && npm run dev` → http://localhost:5173/hollowsurv/
 
 ## Stack
 
@@ -182,7 +182,7 @@ src/
 ## Deploy / share
 
 ```
-cd "C:\Users\Lrgz0\Code claude\hollowsurv"
+cd "C:\Desktop\Code claude\hollowsurv"
 git add -A
 git commit -m "your message"
 git push
